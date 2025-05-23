@@ -5,17 +5,20 @@ import asyncio
 import pytest  # type: ignore [import-not-found]
 from weakref import ref
 
+@mypyc_attr(native_class=False)
+class Object:
+    """some random weakreffable object"""
+    pass
+
 def test_weakref_ref():
-    # some random weakreffable object
-    obj = asyncio.new_event_loop()
+    obj = Object()
     r = ref(obj)
     assert r() is obj
     obj = None
     assert r() is None, r()
 
 def test_weakref_ref_with_callback():
-    # some random weakreffable object
-    obj = asyncio.new_event_loop()
+    obj = Object()
     r = ref(obj, lambda x: x)
     assert r() is obj
     obj = None
