@@ -4,6 +4,7 @@
 import asyncio
 import pytest  # type: ignore [import-not-found]
 from weakref import ref
+from mypy_extensions import mypyc_attr
 
 @mypyc_attr(native_class=False)
 class Object:
