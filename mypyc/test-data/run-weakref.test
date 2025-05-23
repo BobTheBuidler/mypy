@@ -1,0 +1,22 @@
+# Test cases for weakrefs (compile and run)
+
+[case testWeakrefRef]
+import asyncio
+import pytest  # type: ignore [import-not-found]
+from weakref import ref
+
+def test_weakref_ref():
+    # some random weakreffable object
+    obj = asyncio.new_event_loop()
+    r = ref(obj)
+    assert r() is obj
+    obj = None
+    assert r() is None, r()
+
+def test_weakref_ref_with_callback():
+    # some random weakreffable object
+    obj = asyncio.new_event_loop()
+    r = ref(obj, lambda x: x)
+    assert r() is obj
+    obj = None
+    assert r() is None, r()
