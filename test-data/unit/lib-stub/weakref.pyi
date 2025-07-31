@@ -18,3 +18,5 @@ class CallableProxyType(Generic[_C]):  # "weakcallableproxy"
     def __getattr__(self, attr: str) -> Any: ...
     __call__: _C
     __hash__: ClassVar[None]  # type: ignore[assignment]
+
+__all__ = ["proxy"]
