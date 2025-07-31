@@ -28,6 +28,7 @@ def test_weakref_ref_with_callback():
 def test_weakref_proxy():
     obj = Object()
     p = proxy(obj)
+    assert obj.some_meth() == 1
     assert p.some_meth() == 1
     obj = None
     with pytest.raises(ReferenceError):
@@ -36,6 +37,7 @@ def test_weakref_proxy():
 def test_weakref_proxy_with_callback():
     obj = Object()
     p = proxy(obj, lambda x: x)
+    assert obj.some_meth() == 1
     assert p.some_meth() == 1
     obj = None
     with pytest.raises(ReferenceError):
