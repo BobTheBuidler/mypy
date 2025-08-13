@@ -493,12 +493,13 @@ def make_for_loop_generator(
             return for_list
 
         elif (
-            expr.callee.fullname == "builtins.filter"
+            expr.callee.fullname in ("builtins.filter", "itertools.filterfalse")
             and len(expr.args) == 2
             and all(k == ARG_POS for k in expr.arg_kinds)
         ):
+            filterfalse = expr.callee.fullname == "itertools.filterfalse"
             for_filter = ForFilter(builder, index, body_block, loop_exit, line, nested)
-            for_filter.init(index, expr.args[0], expr.args[1])
+            for_filter.init(index, expr.args[0], expr.args[1], filterfalse)
             return for_filter
 
     if isinstance(expr, CallExpr) and isinstance(expr.callee, MemberExpr) and not expr.args:
@@ -1168,8 +1169,9 @@ class ForFilter(ForGenerator):
         # redundant cleanup block, but that's okay.
         return True
 
-    def init(self, index: Lvalue, func: Expression, iterable: Expression) -> None:
+    def init(self, index: Lvalue, func: Expression, iterable: Expression, filterfalse: bool) -> None:
         self.filter_func_def = func
+        self.filterfalse = filterfalse
         if (
             isinstance(func, NameExpr)
             and isinstance(func.node, Var)
@@ -1217,9 +1219,12 @@ class ForFilter(ForGenerator):
             result = transform_call_expr(builder, fake_call_expr)
 
         # Now, filter: only enter the body if func(item) is truthy
-        cont_block, rest_block = BasicBlock(), BasicBlock()
-        builder.add_bool_branch(result, rest_block, cont_block)
-        builder.activate_block(cont_block)
+        skip_block, rest_block = BasicBlock(), BasicBlock()
+        if self.filterfalse:
+            builder.add_bool_branch(result, skip_block, rest_block)
+        else:
+            builder.add_bool_branch(result, rest_block, skip_block)
+        builder.activate_block(skip_block)
         builder.nonlocal_control[-1].gen_continue(builder, line)
         builder.goto_and_activate(rest_block)
         # At this point, the rest of the loop body (user code) will be emitted
