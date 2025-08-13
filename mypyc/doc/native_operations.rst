@@ -38,6 +38,7 @@ Functions
 * ``globals()``
 * ``sorted(obj)``
 * ``filter(fn, iterable)``
+* ``itertools.filterfalse(fn, iterable)``
 
 Method decorators
 -----------------
