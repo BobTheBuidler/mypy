@@ -781,20 +781,37 @@ def try_specialize_in_expr(
     builder: IRBuilder, op: str, lhs: Expression, rhs: Expression, line: int
 ) -> Value | None:
     left: Value | None = None
-    items: list[Value] | None = None
+    tuple_val: Value | None = None
 
-    if isinstance(rhs, (TupleExpr, ListExpr)):
+    if isinstance(rhs, (TupleExpr, ListExpr)) or isinstance(rtype := builder.node_type(rhs), RTuple):
         left = builder.accept(lhs)
-        items = [builder.accept(item) for item in rhs.items]
-    elif isinstance(builder.node_type(rhs), RTuple):
-        left = builder.accept(lhs)
-        tuple_val = builder.accept(rhs)
-        assert isinstance(tuple_val.type, RTuple)
-        items = [builder.add(TupleGet(tuple_val, i)) for i in range(len(tuple_val.type.types))]
-
-    if items is not None:
         assert left is not None
-        n_items = len(items)
+        
+        def getitem_sequence(i: int) -> Value:
+            return builder.accept(rhs.items[i])
+        
+        def getitem_rtuple(i: int) -> Value:
+            assert tuple_val
+            return builder.add(TupleGet(tuple_val, i))
+        
+        if isinstance(rhs, (TupleExpr, ListExpr)):
+            getitem = getitem_sequence
+            n_items = len(rhs.items)
+        elif isinstance(rtype, RTuple):
+            tuple_val = builder.accept(rhs)
+            assert isinstance(tuple_val.type, RTuple)
+            getitem = getitem_rtuple
+            n_items = len(tuple_val.type.types)
+        
+        # Early exit if no items
+        # x in []/() -> False
+        # x not in []/() -> True
+        if n_items == 0:
+            if op == "in":
+                return builder.false()
+            else:
+                return builder.true()
+
         # x in y -> x == y[0] or ... or x == y[n]
         # x not in y -> x != y[0] and ... and x != y[n]
         if n_items > 1:
@@ -803,7 +820,8 @@ def try_specialize_in_expr(
             else:
                 cmp_op = "!="
             out = BasicBlock()
-            for item in items:
+            for i in range(n_items):
+                item = getitem(i)
                 cmp = transform_basic_comparison(builder, cmp_op, left, item, line)
                 bool_val = builder.builder.bool_value(cmp)
                 next_block = BasicBlock()
@@ -825,22 +843,16 @@ def try_specialize_in_expr(
             builder.goto(end)
             builder.activate_block(end)
             return result_reg
+
         # x in [y]/(y) -> x == y
         # x not in [y]/(y) -> x != y
-        elif n_items == 1:
-            if op == "in":
-                cmp_op = "=="
-            else:
-                cmp_op = "!="
-            right = items[0]
-            return transform_basic_comparison(builder, cmp_op, left, right, line)
-        # x in []/() -> False
-        # x not in []/() -> True
-        elif n_items == 0:
-            if op == "in":
-                return builder.false()
-            else:
-                return builder.true()
+        assert n_items == 1
+        if op == "in":
+            cmp_op = "=="
+        else:
+            cmp_op = "!="
+        right = getitem(0)
+        return transform_basic_comparison(builder, cmp_op, left, right, line)
 
     # x in {...}
     # x not in {...}
