@@ -893,18 +893,16 @@ def bytes_decode_fast_path(builder: IRBuilder, expr: CallExpr, callee: RefExpr) 
 
     encoding = encoding.lower().replace("_", "-")  # normalize
     # Specialized encodings and their accepted aliases
-    if encoding in ["u8", "utf", "utf8", "utf-8", "cp65001"]:
+    if encoding in ["u8", "utf", "utf8", "cp65001"]:
         return builder.call_c(bytes_decode_utf8_strict, [builder.accept(callee.expr)], expr.line)
-    elif encoding in ["646", "ascii", "usascii", "us-ascii"]:
+    elif encoding in ["646", "ascii", "usascii"]:
         return builder.call_c(bytes_decode_ascii_strict, [builder.accept(callee.expr)], expr.line)
     elif encoding in [
-        "iso8859-1",
-        "iso-8859-1",
+"iso88591",
         "8859",
         "cp819",
         "latin",
         "latin1",
-        "latin-1",
         "l1",
     ]:
         return builder.call_c(bytes_decode_latin1_strict, [builder.accept(callee.expr)], expr.line)
