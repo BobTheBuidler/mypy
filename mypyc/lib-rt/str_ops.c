@@ -421,6 +421,11 @@ int CPyStr_Startswith(PyObject *self, PyObject *subobj) {
     return PyUnicode_Tailmatch(self, subobj, start, end, -1);
 }
 
+int CPyStr_StartswithStr(PyObject *self, PyObject *subobj) {
+    // subobj MUST be a string
+    return PyUnicode_Tailmatch(self, subobj, 0, PyUnicode_GET_LENGTH(self), -1);
+}
+
 int CPyStr_Endswith(PyObject *self, PyObject *subobj) {
     Py_ssize_t start = 0;
     Py_ssize_t end = PyUnicode_GET_LENGTH(self);
@@ -443,6 +448,120 @@ int CPyStr_Endswith(PyObject *self, PyObject *subobj) {
         return 0;
     }
     return PyUnicode_Tailmatch(self, subobj, start, end, 1);
+}
+
+int CPyStr_EndswithStr(PyObject *self, PyObject *subobj) {
+    // subobj MUST be a string class
+    return PyUnicode_Tailmatch(self, subobj, 0, PyUnicode_GET_LENGTH(self), -1);
+}
+
+int CPyStr_EndswithLiteral(PyObject *self, PyObject *subobj, py_ssize_t suffix_len) {
+    // TODO work on this, rebuild some logic from https://github.com/python/cpython/blob/3.13/Objects/unicodeobject.c#L9560
+    // self and subobj MUST both be a builtins.str
+    int kind_self;
+    int kind_sub;
+    const void *data_self;
+    const void *data_sub;
+    Py_ssize_t offset;
+    Py_ssize_t i;
+    Py_ssize_t end_sub;
+
+    Py_ssize_t start = 0;
+    Py_ssize_t end = PyUnicode_GET_LENGTH(self) - suffix_len;
+    
+    if (end < start)
+        return 0;
+
+    if (suffix_len == 0)
+        // TODO move this check into the specializer
+        return 1;
+
+    kind_self = PyUnicode_KIND(self);
+    data_self = PyUnicode_DATA(self);
+    kind_sub = PyUnicode_KIND(substring);
+    data_sub = PyUnicode_DATA(substring);
+    end_sub = suffix_len - 1;
+
+    if (direction > 0)
+        offset = end;
+    else
+        offset = start;
+
+    if (PyUnicode_READ(kind_self, data_self, offset) ==
+        PyUnicode_READ(kind_sub, data_sub, 0) &&
+        PyUnicode_READ(kind_self, data_self, offset + end_sub) ==
+        PyUnicode_READ(kind_sub, data_sub, end_sub)) {
+        /* If both are of the same kind, memcmp is sufficient */
+        if (kind_self == kind_sub) {
+            return ! memcmp((char *)data_self + (offset * kind_sub), data_sub, suffix_len * kind_sub);
+        }
+        /* otherwise we have to compare each character by first accessing it */
+        else {
+            /* We do not need to compare 0 and len(substring)-1 because
+               the if statement above ensured already that they are equal
+               when we end up here. */
+            for (i = 1; i < end_sub; ++i) {
+                if (PyUnicode_READ(kind_self, data_self, offset + i) !=
+                    PyUnicode_READ(kind_sub, data_sub, i))
+                    return 0;
+            }
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+int CPyStr_EndswithLiteral(PyObject *self, PyObject *subobj, py_ssize_t suffix_len) {
+    return _CPyStr_EndswithLiteral(self, 
+}
+
+int CPyStr_EndswithStrs(PyObject *self, PyObject *subobj, py_ssize_t num_suffixes) {
+    // subobj MUST be a tuple which contains ONLY strings
+    Py_ssize_t start = 0;
+    Py_ssize_t end = PyUnicode_GET_LENGTH(self);
+    
+    Py_ssize_t i;
+    for (i = 0; i < PyTuple_GET_SIZE(subobj); i++) {
+        PyObject *substring = PyTuple_GET_ITEM(subobj, i);
+        if (!PyUnicode_Check(substring)) {
+            PyErr_Format(PyExc_TypeError,
+                         "tuple for endswith must only contain str, "
+                         "not %.100s",
+                         Py_TYPE(substring)->tp_name);
+            return 2;
+        }
+        int result = PyUnicode_Tailmatch(self, substring, start, end, 1);
+        if (result) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int CPyStr_EndswithLiterals(PyObject *self, PyObject *subobj, py_ssize_t num_suffixes) {
+    // TODO work on this, extract most of CPyStr_EndswithLiteral to a helper func and reuse it here
+    // subobj MUST be a tuple which contains ONLY strings
+    Py_ssize_t start = 0;
+    Py_ssize_t end = PyUnicode_GET_LENGTH(self);
+    
+    Py_ssize_t i;
+    for (i = 0; i < PyTuple_GET_SIZE(subobj); i++) {
+        PyObject *substring = PyTuple_GET_ITEM(subobj, i);
+        if (!PyUnicode_Check(substring)) {
+            PyErr_Format(PyExc_TypeError,
+                         "tuple for endswith must only contain str, "
+                         "not %.100s",
+                         Py_TYPE(substring)->tp_name);
+            return 2;
+        }
+        int result = PyUnicode_Tailmatch(self, substring, start, end, 1);
+        if (result) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 PyObject *CPyStr_Removeprefix(PyObject *self, PyObject *prefix) {
