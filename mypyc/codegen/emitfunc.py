@@ -513,479 +513,169 @@ class FunctionEmitterVisitor(OpVisitor[None]):
                 self.emitter.emit_dec_ref(attr_expr, attr_rtype)
                 if not always_defined:
                     self.emitter.emit_line("}")
-            elif attr_rtype.error_overlap and not cl.is_always_defined(op.attr):
-                # If there is overlap with the error value, update bitmap to mark
-                # attribute as defined.
-                self.emitter.emit_attr_bitmap_set(src, obj, attr_rtype, cl, op.attr)
-
-            # This steals the reference to src, so we don't need to increment the arg
             self.emitter.emit_line(f"{attr_expr} = {src};")
-            if op.error_kind == ERR_FALSE:
-                self.emitter.emit_line(f"{dest} = 1;")
+            if not op.is_init and attr_rtype.is_refcounted:
+                if not always_defined:
+                    self.emitter.emit_line("if (!({})) {{".format(
+                        self.emitter.error_value_check(attr_rtype, attr_expr, "==")
+                    ))
+                self.emitter.emit_inc_ref(attr_expr, attr_rtype)
+                if not always_defined:
+                    self.emitter.emit_line("}")
 
-    PREFIX_MAP: Final = {
-        NAMESPACE_STATIC: STATIC_PREFIX,
-        NAMESPACE_TYPE: TYPE_PREFIX,
-        NAMESPACE_MODULE: MODULE_PREFIX,
-        NAMESPACE_TYPE_VAR: TYPE_VAR_PREFIX,
-    }
-
-    def visit_load_static(self, op: LoadStatic) -> None:
-        dest = self.reg(op)
-        prefix = self.PREFIX_MAP[op.namespace]
-        name = self.emitter.static_name(op.identifier, op.module_name, prefix)
-        if op.namespace == NAMESPACE_TYPE:
-            name = "(PyObject *)%s" % name
-        self.emit_line(f"{dest} = {name};", ann=op.ann)
-
-    def visit_init_static(self, op: InitStatic) -> None:
-        value = self.reg(op.value)
-        prefix = self.PREFIX_MAP[op.namespace]
-        name = self.emitter.static_name(op.identifier, op.module_name, prefix)
-        if op.namespace == NAMESPACE_TYPE:
-            value = "(PyTypeObject *)%s" % value
-        self.emit_line(f"{name} = {value};")
-        self.emit_inc_ref(name, op.value.type)
-
-    def visit_tuple_get(self, op: TupleGet) -> None:
-        dest = self.reg(op)
+    def visit_set_element(self, op: SetElement) -> None:
+        # TODO: Always decref then incref? Consider parts that might not execute
+        # if above exception occurs.
+        base = self.reg(op.base)
+        index = self.reg(op.index)
         src = self.reg(op.src)
-        self.emit_line(f"{dest} = {src}.f{op.index};")
-        if not op.is_borrowed:
-            self.emit_inc_ref(dest, op.type)
-
-    def get_dest_assign(self, dest: Value) -> str:
-        if not dest.is_void:
-            return self.reg(dest) + " = "
-        else:
-            return ""
-
-    def visit_call(self, op: Call) -> None:
-        """Call native function."""
-        dest = self.get_dest_assign(op)
-        args = ", ".join(self.reg(arg) for arg in op.args)
-        lib = self.emitter.get_group_prefix(op.fn)
-        cname = op.fn.cname(self.names)
-        self.emit_line(f"{dest}{lib}{NATIVE_PREFIX}{cname}({args});")
-
-    def visit_method_call(self, op: MethodCall) -> None:
-        """Call native method."""
-        dest = self.get_dest_assign(op)
-        self.emit_method_call(dest, op.obj, op.method, op.args)
-
-    def emit_method_call(self, dest: str, op_obj: Value, name: str, op_args: list[Value]) -> None:
-        obj = self.reg(op_obj)
-        rtype = op_obj.type
-        assert isinstance(rtype, RInstance), rtype
-        class_ir = rtype.class_ir
-        method = rtype.class_ir.get_method(name)
-        assert method is not None
-
-        # Can we call the method directly, bypassing vtable?
-        is_direct = class_ir.is_method_final(name)
-
-        # The first argument gets omitted for static methods and
-        # turned into the class for class methods
-        obj_args = (
-            []
-            if method.decl.kind == FUNC_STATICMETHOD
-            else [f"(PyObject *)Py_TYPE({obj})"] if method.decl.kind == FUNC_CLASSMETHOD else [obj]
-        )
-        args = ", ".join(obj_args + [self.reg(arg) for arg in op_args])
-        mtype = native_function_type(method, self.emitter)
-        version = "_TRAIT" if rtype.class_ir.is_trait else ""
-        if is_direct:
-            # Directly call method, without going through the vtable.
-            lib = self.emitter.get_group_prefix(method.decl)
-            self.emit_line(f"{dest}{lib}{NATIVE_PREFIX}{method.cname(self.names)}({args});")
-        else:
-            # Call using vtable.
-            method_idx = rtype.method_index(name)
-            self.emit_line(
-                "{}CPY_GET_METHOD{}({}, {}, {}, {}, {})({}); /* {} */".format(
-                    dest,
-                    version,
-                    obj,
-                    self.emitter.type_struct_name(rtype.class_ir),
-                    method_idx,
-                    rtype.struct_name(self.names),
-                    mtype,
-                    args,
-                    name,
-                )
-            )
-
-    def visit_inc_ref(self, op: IncRef) -> None:
-        if (
-            isinstance(op.src, Box)
-            and (is_none_rprimitive(op.src.src.type) or is_bool_or_bit_rprimitive(op.src.src.type))
-            and HAVE_IMMORTAL
-        ):
-            # On Python 3.12+, None/True/False are immortal, and we can skip inc ref
-            return
-
-        if isinstance(op.src, LoadLiteral) and HAVE_IMMORTAL:
-            value = op.src.value
-            # We can skip inc ref for immortal literals on Python 3.12+
-            if type(value) is int and -5 <= value <= 256:
-                # Small integers are immortal
-                return
-
-        src = self.reg(op.src)
-        self.emit_inc_ref(src, op.src.type)
-
-    def visit_dec_ref(self, op: DecRef) -> None:
-        src = self.reg(op.src)
-        self.emit_dec_ref(src, op.src.type, is_xdec=op.is_xdec)
-
-    def visit_box(self, op: Box) -> None:
-        self.emitter.emit_box(self.reg(op.src), self.reg(op), op.src.type, can_borrow=True)
-
-    def visit_cast(self, op: Cast) -> None:
-        if op.is_unchecked and op.is_borrowed:
-            self.emit_line(f"{self.reg(op)} = {self.reg(op.src)};")
-            return
-        branch = self.next_branch()
-        handler = None
-        if branch is not None:
-            if (
-                branch.value is op
-                and branch.op == Branch.IS_ERROR
-                and branch.traceback_entry is not None
-                and not branch.negated
-                and branch.false is self.next_block
-            ):
-                # Generate code also for the following branch here to avoid
-                # redundant branches in the generated code.
-                handler = TracebackAndGotoHandler(
-                    self.label(branch.true),
-                    self.source_path,
-                    self.module_name,
-                    branch.traceback_entry,
-                )
-                self.op_index += 1
-
-        self.emitter.emit_cast(
-            self.reg(op.src), self.reg(op), op.type, src_type=op.src.type, error=handler
-        )
-
-    def visit_unbox(self, op: Unbox) -> None:
-        self.emitter.emit_unbox(self.reg(op.src), self.reg(op), op.type)
-
-    def visit_unreachable(self, op: Unreachable) -> None:
-        self.emitter.emit_line("CPy_Unreachable();")
-
-    def visit_raise_standard_error(self, op: RaiseStandardError) -> None:
-        # TODO: Better escaping of backspaces and such
-        if op.value is not None:
-            if isinstance(op.value, str):
-                message = op.value.replace('"', '\\"')
-                self.emitter.emit_line(f'PyErr_SetString(PyExc_{op.class_name}, "{message}");')
-            elif isinstance(op.value, Value):
-                self.emitter.emit_line(
-                    "PyErr_SetObject(PyExc_{}, {});".format(
-                        op.class_name, self.emitter.reg(op.value)
-                    )
-                )
-            else:
-                assert False, "op value type must be either str or Value"
-        else:
-            self.emitter.emit_line(f"PyErr_SetNone(PyExc_{op.class_name});")
-        self.emitter.emit_line(f"{self.reg(op)} = 0;")
-
-    def visit_call_c(self, op: CallC) -> None:
-        if op.is_void:
-            dest = ""
-        else:
-            dest = self.get_dest_assign(op)
-        args = ", ".join(self.reg(arg) for arg in op.args)
-        self.emitter.emit_line(f"{dest}{op.function_name}({args});")
-
-    def visit_primitive_op(self, op: PrimitiveOp) -> None:
-        raise RuntimeError(
-            f"unexpected PrimitiveOp {op.desc.name}: they must be lowered before codegen"
-        )
-
-    def visit_truncate(self, op: Truncate) -> None:
-        dest = self.reg(op)
-        value = self.reg(op.src)
-        # for C backend the generated code are straight assignments
-        self.emit_line(f"{dest} = {value};")
-
-    def visit_extend(self, op: Extend) -> None:
-        dest = self.reg(op)
-        value = self.reg(op.src)
-        if op.signed:
-            src_cast = self.emit_signed_int_cast(op.src.type)
-        else:
-            src_cast = self.emit_unsigned_int_cast(op.src.type)
-        self.emit_line(f"{dest} = {src_cast}{value};")
-
-    def visit_load_global(self, op: LoadGlobal) -> None:
-        dest = self.reg(op)
-        self.emit_line(f"{dest} = {op.identifier};", ann=op.ann)
-
-    def visit_int_op(self, op: IntOp) -> None:
-        dest = self.reg(op)
-        lhs = self.reg(op.lhs)
-        rhs = self.reg(op.rhs)
-        if op.op == IntOp.RIGHT_SHIFT:
-            # Signed right shift
-            lhs = self.emit_signed_int_cast(op.lhs.type) + lhs
-            rhs = self.emit_signed_int_cast(op.rhs.type) + rhs
-        self.emit_line(f"{dest} = {lhs} {op.op_str[op.op]} {rhs};")
-
-    def visit_comparison_op(self, op: ComparisonOp) -> None:
-        dest = self.reg(op)
-        lhs = self.reg(op.lhs)
-        rhs = self.reg(op.rhs)
-        lhs_cast = ""
-        rhs_cast = ""
-        if op.op in (ComparisonOp.SLT, ComparisonOp.SGT, ComparisonOp.SLE, ComparisonOp.SGE):
-            # Always signed comparison op
-            lhs_cast = self.emit_signed_int_cast(op.lhs.type)
-            rhs_cast = self.emit_signed_int_cast(op.rhs.type)
-        elif op.op in (ComparisonOp.ULT, ComparisonOp.UGT, ComparisonOp.ULE, ComparisonOp.UGE):
-            # Always unsigned comparison op
-            lhs_cast = self.emit_unsigned_int_cast(op.lhs.type)
-            rhs_cast = self.emit_unsigned_int_cast(op.rhs.type)
-        elif isinstance(op.lhs, Integer) and op.lhs.value < 0:
-            # Force signed ==/!= with negative operand
-            rhs_cast = self.emit_signed_int_cast(op.rhs.type)
-        elif isinstance(op.rhs, Integer) and op.rhs.value < 0:
-            # Force signed ==/!= with negative operand
-            lhs_cast = self.emit_signed_int_cast(op.lhs.type)
-        self.emit_line(f"{dest} = {lhs_cast}{lhs} {op.op_str[op.op]} {rhs_cast}{rhs};")
-
-    def visit_float_op(self, op: FloatOp) -> None:
-        dest = self.reg(op)
-        lhs = self.reg(op.lhs)
-        rhs = self.reg(op.rhs)
-        if op.op != FloatOp.MOD:
-            self.emit_line(f"{dest} = {lhs} {op.op_str[op.op]} {rhs};")
-        else:
-            # TODO: This may set errno as a side effect, that is a little sketchy.
-            self.emit_line(f"{dest} = fmod({lhs}, {rhs});")
-
-    def visit_float_neg(self, op: FloatNeg) -> None:
-        dest = self.reg(op)
-        src = self.reg(op.src)
-        self.emit_line(f"{dest} = -{src};")
-
-    def visit_float_comparison_op(self, op: FloatComparisonOp) -> None:
-        dest = self.reg(op)
-        lhs = self.reg(op.lhs)
-        rhs = self.reg(op.rhs)
-        self.emit_line(f"{dest} = {lhs} {op.op_str[op.op]} {rhs};")
-
-    def visit_load_mem(self, op: LoadMem) -> None:
-        dest = self.reg(op)
-        src = self.reg(op.src)
-        # TODO: we shouldn't dereference to type that are pointer type so far
-        type = self.ctype(op.type)
-        self.emit_line(f"{dest} = *({type} *){src};")
-        if not op.is_borrowed:
-            self.emit_inc_ref(dest, op.type)
+        # NOTE: We don't need to emit an exception check here because any exception
+        # will propagate through the next error check, so it doesn't need a traceback.
+        # It's only necessary to emit error checks for the latter if we modify this
+        # in future and allow the traceback entry for the current op to be None.
+        op_expr = f"CPyList_SetItemUnsafe({base}, {index}, {src});"
+        self.emit_line(op_expr)
 
     def visit_set_mem(self, op: SetMem) -> None:
         dest = self.reg(op.dest)
         src = self.reg(op.src)
-        dest_type = self.ctype(op.dest_type)
-        # clang whines about self assignment (which we might generate
-        # for some casts), so don't emit it.
-        if dest != src:
-            self.emit_line(f"*({dest_type} *){dest} = {src};")
+        self.emitter.emit_line(f"*{dest} = {src};")
 
-    def visit_get_element_ptr(self, op: GetElementPtr) -> None:
-        dest = self.reg(op)
-        src = self.reg(op.src)
-        # TODO: support tuple type
-        assert isinstance(op.src_type, RStruct), op.src_type
-        assert op.field in op.src_type.names, "Invalid field name."
-        self.emit_line(
-            "{} = ({})&(({} *){})->{};".format(
-                dest, op.type._ctype, op.src_type.name, src, op.field
-            )
-        )
+    def visit_init_static(self, op: InitStatic) -> None:
+        # When initializing a static variable, just assign it directly.
+        self.emit_line(f"{self.reg(op.dest)} = {self.reg(op.src)};")
 
-    def visit_set_element(self, op: SetElement) -> None:
-        dest = self.reg(op)
-        item = self.reg(op.item)
-        field = op.field
-        if isinstance(op.src, Undef):
-            # First assignment to an undefined struct is trivial.
-            self.emit_line(f"{dest}.{field} = {item};")
+    def visit_tuple_get(self, op: TupleGet) -> None:
+        if op.src.type.is_refcounted:
+            self.emitter.emit_inc_ref(self.reg(op.src), op.src.type)
+        item_rtype = op.src_type
+        if isinstance(item_rtype, RStruct):
+            # Access an unboxed tuple struct directly
+            self.emit_line(f"{self.reg(op)} = {self.reg(op.src)}.f{op.index};")
         else:
-            # In the general case create a copy of the struct with a single
-            # item modified.
-            #
-            # TODO: Can we do better if only a subset of fields are initialized?
-            # TODO: Make this less verbose in the common case
-            # TODO: Support tuples (or use RStruct for tuples)?
-            src = self.reg(op.src)
-            src_type = op.src.type
-            assert isinstance(src_type, RStruct), src_type
-            init_items = []
-            for n in src_type.names:
-                if n != field:
-                    init_items.append(f"{src}.{n}")
-                else:
-                    init_items.append(item)
-            self.emit_line(f"{dest} = ({self.ctype(src_type)}) {{ {', '.join(init_items)} }};")
-
-    def visit_load_address(self, op: LoadAddress) -> None:
-        typ = op.type
-        dest = self.reg(op)
-        if isinstance(op.src, Register):
-            src = self.reg(op.src)
-        elif isinstance(op.src, LoadStatic):
-            prefix = self.PREFIX_MAP[op.src.namespace]
-            src = self.emitter.static_name(op.src.identifier, op.src.module_name, prefix)
-        else:
-            src = op.src
-        self.emit_line(f"{dest} = ({typ._ctype})&{src};")
+            # Access a boxed tuple using its C API
+            # TODO: We should be using a more efficient method for this
+            self.emit_line(f"{self.reg(op)} = PyTuple_GetItem({self.reg(op.src)}, {op.index});")
+            # We don't need to check PyTuple_GetItem for error because we already
+            # know that the tuple is the right size
+            self.emitter.emit_inc_ref(self.reg(op), item_rtype)
 
     def visit_keep_alive(self, op: KeepAlive) -> None:
-        # This is a no-op.
-        pass
+        # Generate a branch that is always false to keep something alive without
+        # adding any run-time overhead.
+        self.emit_line("if (0) {}".format(self.reg(op.src)))
 
-    def visit_unborrow(self, op: Unborrow) -> None:
-        # This is a no-op that propagates the source value.
-        dest = self.reg(op)
-        src = self.reg(op.src)
-        self.emit_line(f"{dest} = {src};")
-
-    # Helpers
-
-    def label(self, label: BasicBlock) -> str:
-        return self.emitter.label(label)
-
-    def reg(self, reg: Value) -> str:
-        if isinstance(reg, Integer):
-            val = reg.value
-            if val == 0 and is_pointer_rprimitive(reg.type):
-                return "NULL"
-            s = str(val)
-            if val >= (1 << 31):
-                # Avoid overflowing signed 32-bit int
-                if val >= (1 << 63):
-                    s += "ULL"
-                else:
-                    s += "LL"
-            elif val == -(1 << 63):
-                # Avoid overflowing C integer literal
-                s = "(-9223372036854775807LL - 1)"
-            elif val <= -(1 << 31):
-                s += "LL"
-            return s
-        elif isinstance(reg, Float):
-            r = repr(reg.value)
-            if r == "inf":
-                return "INFINITY"
-            elif r == "-inf":
-                return "-INFINITY"
-            elif r == "nan":
-                return "NAN"
-            return r
-        elif isinstance(reg, CString):
-            return '"' + encode_c_string_literal(reg.value) + '"'
+    def visit_primitive_op(self, op: PrimitiveOp) -> None:
+        # These are special and can handle return values of different types.
+        if op.prim_op in (int_op, int_op_unsafe):
+            assert len(op.args) == 1
+            self.emit_line("%s = %s;" % (self.reg(op), self.reg(op.args[0])))
         else:
-            return self.emitter.reg(reg)
+            args = ", ".join(self.reg(arg) for arg in op.args)
+            if op.prim_op in (ckres_op, ckres_int_op, ckres_sized_op, ckres_nop_exc_op):
+                # Special case: these ops return an int directly (0 or 1, typically)
+                # where 0 indicates error. This is not a special "error" value.
+                result = f"{self.reg(op)} = {op.prim_op.c_function_name}({args});"
+                self.emit_line(result)
 
-    def ctype(self, rtype: RType) -> str:
-        return self.emitter.ctype(rtype)
-
-    def c_error_value(self, rtype: RType) -> str:
-        return self.emitter.c_error_value(rtype)
-
-    def c_undefined_value(self, rtype: RType) -> str:
-        return self.emitter.c_undefined_value(rtype)
-
-    def emit_line(self, line: str, *, ann: object = None) -> None:
-        self.emitter.emit_line(line, ann=ann)
-
-    def emit_lines(self, *lines: str) -> None:
-        self.emitter.emit_lines(*lines)
-
-    def emit_inc_ref(self, dest: str, rtype: RType) -> None:
-        self.emitter.emit_inc_ref(dest, rtype, rare=self.rare)
-
-    def emit_dec_ref(self, dest: str, rtype: RType, is_xdec: bool) -> None:
-        self.emitter.emit_dec_ref(dest, rtype, is_xdec=is_xdec, rare=self.rare)
-
-    def emit_declaration(self, line: str) -> None:
-        self.declarations.emit_line(line)
-
-    def emit_traceback(self, op: Branch) -> None:
-        if op.traceback_entry is not None:
-            self.emitter.emit_traceback(self.source_path, self.module_name, op.traceback_entry)
-
-    def emit_attribute_error(self, op: Branch, class_ir: ClassIR, attr: str) -> None:
-        assert op.traceback_entry is not None
-        globals_static = self.emitter.static_name("globals", self.module_name)
-        if class_ir.is_environment:
-            self.emit_line(
-                'CPy_UnboundLocalError("%s", "%s", "%s", %d, %s);'
-                % (
-                    self.source_path.replace("\\", "\\\\"),
-                    op.traceback_entry[0],
-                    attr.removeprefix(GENERATOR_ATTRIBUTE_PREFIX),
-                    op.traceback_entry[1],
-                    globals_static,
+                # If the op has a traceback position, check it immediately. We can't
+                # use emit_line_loan_with_traceback since we need the result for
+                # the check. Note that we assume the op is not borrowed (it isn't
+                # currently possible for a primitive op to return a borrowed value).
+                if op.traceback_entry is not None:
+                    self.emitter.emit_traceback(self.source_path, self.module_name, op.traceback_entry)
+                    self.emitter.emit_line(
+                        f"if (unlikely({self.reg(op)} == 2)) goto {self.label(op.error_label)};"
+                    )
+            else:
+                self.emit_line(
+                    f"{self.reg(op)} = {op.prim_op.c_function_name}({args});",
+                    ann=op.value,
                 )
+
+                if op.traceback_entry is not None:
+                    self.emitter.emit_traceback(self.source_path, self.module_name, op.traceback_entry)
+                    self.emitter.emit_line(
+                        f"if (unlikely({self.reg(op)} == {self.c_error_value(op.type)})) goto {self.label(op.error_label)};"
+                    )
+
+    def visit_raise_standard_error(self, op: RaiseStandardError) -> None:
+        # This includes temporary variable declarations for some of the
+        # error types that need a variable to be passed to the generic
+        # emit_type_error_traceback function.
+        rtype = op.class_ir
+        if rtype is None:
+            rtype = op.value.type
+        if isinstance(rtype, RInstance):
+            rtype = rtype.class_ir
+        error_kind = op.error_kind
+        if error_kind == ERR_FALSE:
+            rtype = None  # type: ignore[assignment]
+        if error_kind == ERR_FALSE and op.prim_op is not None:
+            # Special case: these ops return an int directly (0 or 1, typically)
+            # where 0 indicates error. This is not a special "error" value.
+            # So we need to ignore the type in those cases.
+            rtype = None  # type: ignore[assignment]
+        if rtype is not None and rtype.cdef is not None:
+            name = rtype.cdef.name
+        elif error_kind == ERR_FALSE:
+            name = None
+        elif error_kind == ERR_NEG_INT:
+            name = "OverflowError"
+        elif error_kind == ERR_MAGIC:
+            name = "StopIteration"
+        elif error_kind == ERR_FALSE:
+            name = "AssertionError"
+        else:
+            name = ""
+
+        if error_kind == ERR_MAGIC:
+            # TODO: We could move some of this logic into the traceback handling code
+            # to avoid doing it twice.
+            if op.traceback_entry is not None:
+                self.emitter.emit_traceback(self.source_path, self.module_name, op.traceback_entry)
+            self.emitter.emit_line(
+                "if (unlikely(PyErr_Occurred() != NULL)) goto %s;" % self.label(op.error_label)
             )
         else:
-            self.emit_line(
-                'CPy_AttributeError("%s", "%s", "%s", "%s", %d, %s);'
-                % (
-                    self.source_path.replace("\\", "\\\\"),
-                    op.traceback_entry[0],
-                    class_ir.name,
-                    attr.removeprefix(GENERATOR_ATTRIBUTE_PREFIX),
-                    op.traceback_entry[1],
-                    globals_static,
-                )
-            )
-        if DEBUG_ERRORS:
-            self.emit_line('assert(PyErr_Occurred() != NULL && "failure w/o err!");')
-
-    def emit_signed_int_cast(self, type: RType) -> str:
-        if is_tagged(type):
-            return "(Py_ssize_t)"
-        else:
-            return ""
-
-    def emit_unsigned_int_cast(self, type: RType) -> str:
-        if is_int32_rprimitive(type):
-            return "(uint32_t)"
-        elif is_int64_rprimitive(type):
-            return "(uint64_t)"
-        else:
-            return ""
-
-
-_translation_table: Final[dict[int, str]] = {}
-
-
-def encode_c_string_literal(b: bytes) -> str:
-    """Convert bytestring to the C string literal syntax (with necessary escaping).
-
-    For example, b'foo\n' gets converted to 'foo\\n' (note that double quotes are not added).
-    """
-    if not _translation_table:
-        # Initialize the translation table on the first call.
-        d = {
-            ord("\n"): "\\n",
-            ord("\r"): "\\r",
-            ord("\t"): "\\t",
-            ord('"'): '\\"',
-            ord("\\"): "\\\\",
-        }
-        for i in range(256):
-            if i not in d:
-                if i < 32 or i >= 127:
-                    d[i] = "\\x%.2x" % i
+            if op.traceback_entry is not None:
+                if rtype is None:
+                    self.emitter.emit_traceback(self.source_path, self.module_name, op.traceback_entry)
+                    self.emitter.emit_line(
+                        "if (unlikely(PyErr_Occurred() != NULL)) goto %s;"
+                        % self.label(op.error_label)
+                    )
                 else:
-                    d[i] = chr(i)
-        _translation_table.update(str.maketrans(d))
-    return b.decode("latin1").translate(_translation_table)
+                    self.emit_type_error_traceback(rtype, self.reg(op.value), op.traceback_entry)
+
+            # Emit the error handler call or just set the exception
+            if op.traceback_entry is None:
+                # If there is no traceback, we can just set the error and return.
+                if error_kind == ERR_FALSE:
+                    # With ERR_FALSE, the caller already set the error.
+                    self.emitter.emit_line(f"{self.reg(op)} = 0;")
+                elif error_kind == ERR_NEG_INT:
+                    self.emitter.emit_line(f"{self.reg(op)} = -1;")
+                elif error_kind == ERR_MAGIC:
+                    self.emitter.emit_line(f"{self.reg(op)} = -1;")
+                else:
+                    self.emitter.emit_line(f"{self.reg(op)} = 0;")
+                return
+
+            # If there is a traceback, call the error handler.
+            if error_kind == ERR_MAGIC:
+                if op.traceback_entry is not None:
+                    self.emit_line("goto %s;" % self.label(op.error_label))
+            elif error_kind == ERR_FALSE:
+                # With ERR_FALSE, the caller already set the error.
+                if op.traceback_entry is not None:
+                    self.emit_line("goto %s;" % self.label(op.error_label))
+            else:
+                if rtype is None:
+                    if op.prim_op is not None:
+                        self.emit_line("goto %s;" % self.label(op.error_label))
+                    else:
+                        self.emit_line("goto %s;" % self.label(op.error_label))
+                else:
+                    self.emit_type_error_traceback(rtype, self.reg(op.value), op.traceback_entry)
+                    self.emit_line("goto %s;" % self.label(op.error_label))
