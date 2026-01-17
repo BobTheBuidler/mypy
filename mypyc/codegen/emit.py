@@ -1290,34 +1290,93 @@ def native_function_doc_initializer(func: FuncIR) -> str:
 
 def pformat_deterministic(obj: object, width: int) -> str:
     """Pretty-print `obj` with deterministic sorting for mypyc literal types."""
-    # Temporarily override pprint._safe_key to get deterministic ordering of containers.
-    default_safe_key = pprint._safe_key  # type: ignore [attr-defined]
-    pprint._safe_key = _mypyc_safe_key  # type: ignore [attr-defined]
+    printer = _DeterministicPrettyPrinter(width=width, compact=True, sort_dicts=True)
+    return printer.pformat(obj)
 
-    try:
-        printer = _DeterministicPrettyPrinter(width=width, compact=True, sort_dicts=True)
-        return printer.pformat(obj)
-    finally:
-        # Always restore the original key to avoid affecting other pprint users.
-        pprint._safe_key = default_safe_key  # type: ignore [attr-defined]
+
+def _deterministic_repr(obj: object) -> str:
+    printer = _DeterministicPrettyPrinter(width=80, compact=True, sort_dicts=True)
+    return printer._safe_repr(obj, {}, None, 0)[0]
 
 
 def _mypyc_safe_key(obj: object) -> str:
     """A custom sort key implementation for pprint that makes the output deterministic
     for all literal types supported by mypyc.
 
-    This is NOT safe for use as a sort key for other types, so we MUST replace the
-    original pprint._safe_key once we've pprinted our object.
-
     Since this is a bit hacky, see for context https://github.com/python/mypy/pull/20012
     """
-    return str(type(obj)) + pprint.pformat(obj, compact=True, sort_dicts=True)
+    return str(type(obj)) + _deterministic_repr(obj)
 
 
 class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
     """PrettyPrinter that sorts set/frozenset elements deterministically."""
 
     _dispatch = pprint.PrettyPrinter._dispatch.copy()
+
+    def _safe_repr(
+        self, object: object, context: dict[int, int], maxlevels: int | None, level: int
+    ) -> tuple[str, bool, bool]:
+        # Return triple (repr_string, isreadable, isrecursive).
+        typ = type(object)
+        r = getattr(typ, "__repr__", None)
+
+        if issubclass(typ, dict) and r is dict.__repr__:
+            if not object:
+                return "{}", True, False
+            objid = id(object)
+            if maxlevels and level >= maxlevels:
+                return "{...}", False, objid in context
+            if objid in context:
+                return pprint._recursion(object), False, True  # type: ignore [attr-defined]
+            context[objid] = 1
+            readable = True
+            recursive = False
+            components: list[str] = []
+            level += 1
+            items = sorted(
+                object.items(),
+                key=lambda item: (_mypyc_safe_key(item[0]), _mypyc_safe_key(item[1])),
+            )
+            for k, v in items:
+                krepr, kreadable, krecur = self.format(k, context, maxlevels, level)
+                vrepr, vreadable, vrecur = self.format(v, context, maxlevels, level)
+                components.append(f"{krepr}: {vrepr}")
+                readable = readable and kreadable and vreadable
+                if krecur or vrecur:
+                    recursive = True
+            del context[objid]
+            return "{%s}" % ", ".join(components), readable, recursive
+
+        if (issubclass(typ, set) and r is set.__repr__) or (
+            issubclass(typ, frozenset) and r is frozenset.__repr__
+        ):
+            if not object:
+                return ("set()" if typ is set else "frozenset()"), True, False
+            objid = id(object)
+            if maxlevels and level >= maxlevels:
+                placeholder = "{...}" if typ is set else "frozenset({...})"
+                return placeholder, False, objid in context
+            if objid in context:
+                return pprint._recursion(object), False, True  # type: ignore [attr-defined]
+            context[objid] = 1
+            readable = True
+            recursive = False
+            components: list[str] = []
+            level += 1
+            for o in sorted(object, key=_mypyc_safe_key):
+                orepr, oreadable, orecur = self.format(o, context, maxlevels, level)
+                components.append(orepr)
+                if not oreadable:
+                    readable = False
+                if orecur:
+                    recursive = True
+            del context[objid]
+            body = ", ".join(components)
+            if typ is set:
+                return "{%s}" % body, readable, recursive
+            return "frozenset({%s})" % body, readable, recursive
+
+        return super()._safe_repr(object, context, maxlevels, level)
 
     def _pprint_set(
         self,

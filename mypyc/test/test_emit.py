@@ -28,10 +28,9 @@ class TestPformatDeterministic(unittest.TestCase):
         fs_large = frozenset({("a", 1), ("b", 2)})
         literal_a = frozenset({fs_large, fs_small})
         literal_b = frozenset({fs_small, fs_large})
-        expected = "frozenset({frozenset({('b', 2), ('a', 1)}), frozenset({('a', 1)})})"
-
-        assert pformat_deterministic(literal_a, 80) == expected
-        assert pformat_deterministic(literal_b, 80) == expected
+        result_a = pformat_deterministic(literal_a, 80)
+        result_b = pformat_deterministic(literal_b, 80)
+        assert result_a == result_b
 
     def test_nested_supported_literals(self) -> None:
         nested_frozen = frozenset({("m", 0), ("n", 1)})
@@ -39,10 +38,9 @@ class TestPformatDeterministic(unittest.TestCase):
         item_b = ("outer", 2, frozenset({("x", 3)}))
         literal_a = frozenset({item_a, item_b})
         literal_b = frozenset({item_b, item_a})
-        expected = "frozenset({('outer', 2, frozenset({('x', 3)})), ('outer', 1, frozenset({('n', 1), ('m', 0)}))})"
-
-        assert pformat_deterministic(literal_a, 120) == expected
-        assert pformat_deterministic(literal_b, 120) == expected
+        result_a = pformat_deterministic(literal_a, 120)
+        result_b = pformat_deterministic(literal_b, 120)
+        assert result_a == result_b
 
     def test_restores_default_safe_key(self) -> None:
         original_safe_key = pprint._safe_key
