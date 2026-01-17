@@ -6,7 +6,7 @@ import pprint
 import sys
 import textwrap
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 from mypyc.codegen.cstring import c_string_initializer
 from mypyc.codegen.literals import Literals
@@ -926,13 +926,15 @@ def _mypyc_safe_key(obj: object) -> tuple[str, object]:
     return _literal_sort_key(obj)
 
 
+def _recursion_repr(obj: object) -> str:
+    return f"<Recursion on {type(obj).__name__} with id={id(obj)}>"
+
+
 class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
     """PrettyPrinter that sorts set/frozenset elements deterministically."""
 
-    _dispatch = pprint.PrettyPrinter._dispatch.copy()
-
     def format(
-        self, object: object, context: dict[int, int], maxlevels: int | None, level: int
+        self, object: object, context: dict[int, int], maxlevels: int, level: int
     ) -> tuple[str, bool, bool]:
         if isinstance(object, (set, frozenset)) and type(object).__repr__ in (
             set.__repr__,
@@ -945,7 +947,7 @@ class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
         self,
         object: set[object] | frozenset[object],
         context: dict[int, int],
-        maxlevels: int | None,
+        maxlevels: int,
         level: int,
     ) -> tuple[str, bool, bool]:
         if not object:
@@ -956,7 +958,7 @@ class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
                 return "frozenset({...})", False, objid in context
             return "{...}", False, objid in context
         if objid in context:
-            return pprint._recursion(object), False, True
+            return _recursion_repr(object), False, True
         context[objid] = 1
         readable = True
         recursive = False
@@ -974,6 +976,36 @@ class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
         if isinstance(object, frozenset):
             return f"frozenset({{{', '.join(components)}}})", readable, recursive
         return "{" + ", ".join(components) + "}", readable, recursive
+
+    def _format(
+        self,
+        object: object,
+        stream: SupportsWrite[str],
+        indent: int,
+        allowance: int,
+        context: dict[int, int],
+        level: int,
+    ) -> None:
+        if isinstance(object, (set, frozenset)) and type(object).__repr__ in (
+            set.__repr__,
+            frozenset.__repr__,
+        ):
+            objid = id(object)
+            if objid in context:
+                stream.write(_recursion_repr(object))
+                self._recursive = True
+                self._readable = False
+                return
+            rep = self._repr(object, context, level)
+            max_width = cast(int, getattr(self, "_width")) - indent - allowance
+            if len(rep) > max_width:
+                context[objid] = 1
+                self._pprint_set(object, stream, indent, allowance, context, level + 1)
+                del context[objid]
+                return
+            stream.write(rep)
+            return
+        super()._format(object, stream, indent, allowance, context, level)
 
     def _pprint_set(
         self,
@@ -998,6 +1030,3 @@ class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
         items = sorted(object, key=_mypyc_safe_key)
         self._format_items(items, stream, indent, allowance + len(endchar), context, level)
         stream.write(endchar)
-
-    _dispatch[set.__repr__] = _pprint_set
-    _dispatch[frozenset.__repr__] = _pprint_set
