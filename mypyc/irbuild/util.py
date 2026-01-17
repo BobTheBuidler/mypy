@@ -37,8 +37,8 @@ MYPYC_ATTRS: Final[frozenset[MypycAttr]] = frozenset(
         "native_class",
         "allow_interpreted_subclasses",
         "serializable",
-        "free_list_len",
         "supports_weakref",
+        "free_list_len",
     ]
 )
 
@@ -49,8 +49,8 @@ MypycAttr = Literal[
     "native_class",
     "allow_interpreted_subclasses",
     "serializable",
-    "free_list_len",
     "supports_weakref",
+    "free_list_len",
 ]
 
 
@@ -58,8 +58,8 @@ class MypycAttrs(TypedDict):
     native_class: NotRequired[bool]
     allow_interpreted_subclasses: NotRequired[bool]
     serializable: NotRequired[bool]
-    free_list_len: NotRequired[int]
     supports_weakref: NotRequired[bool]
+    free_list_len: NotRequired[int]
 
 
 def is_final_decorator(d: Expression) -> bool:
