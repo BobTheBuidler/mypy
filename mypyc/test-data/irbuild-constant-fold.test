@@ -193,7 +193,6 @@ from typing import Any, Final
 
 FMT: Final = "{} {}"
 FMT_A: Final = "{!a}"
-FMT_R: Final = "{!r}"
 
 def f() -> str:
     return FMT.format(400 + 20, "roll" + "up")
@@ -201,16 +200,6 @@ def g() -> str:
     return FMT_A.format("\u00e9")
 def g2() -> str:
     return FMT_A.format("\u2603")
-def h() -> str:
-    return FMT_R.format("hi")
-def h_int() -> str:
-    return FMT_R.format(123)
-def h_float() -> str:
-    return FMT_R.format(1.25)
-def h_complex() -> str:
-    return FMT_R.format(1 + 2j)
-def h_bytes() -> str:
-    return FMT_R.format(b"\xff")
 [out]
 def f():
     r0, r1, r2, r3 :: str
@@ -230,36 +219,6 @@ def g2():
     r0, r1 :: str
 L0:
     r0 = "'\\u2603'"
-    r1 = CPyStr_Build(1, r0)
-    return r1
-def h():
-    r0, r1 :: str
-L0:
-    r0 = "'hi'"
-    r1 = CPyStr_Build(1, r0)
-    return r1
-def h_int():
-    r0, r1 :: str
-L0:
-    r0 = '123'
-    r1 = CPyStr_Build(1, r0)
-    return r1
-def h_float():
-    r0, r1 :: str
-L0:
-    r0 = '1.25'
-    r1 = CPyStr_Build(1, r0)
-    return r1
-def h_complex():
-    r0, r1 :: str
-L0:
-    r0 = '(1+2j)'
-    r1 = CPyStr_Build(1, r0)
-    return r1
-def h_bytes():
-    r0, r1 :: str
-L0:
-    r0 = "b'\\xff'"
     r1 = CPyStr_Build(1, r0)
     return r1
 

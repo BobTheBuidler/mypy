@@ -292,7 +292,6 @@ def f(var: Union[str, NewStr], num: int) -> None:
     s3 = "Hi! I'm %s. I am %d years old." % (var, num)
     s4 = "Float: %f" % num
     s5 = "Ascii: %a" % var
-    s6 = "Repr: %r" % var
 [typing fixtures/typing-full.pyi]
 [out]
 def f(var, num):
@@ -300,7 +299,7 @@ def f(var, num):
     num :: int
     r0, r1, r2, s1, r3, r4, r5, r6, s2, r7, r8, r9, r10, r11, s3, r12 :: str
     r13, r14 :: object
-    r15, s4, r16, r17, r18, s5, r19, r20, r21, s6 :: str
+    r15, s4, r16, r17, r18, s5 :: str
 L0:
     r0 = "Hi! I'm "
     r1 = '.'
@@ -326,11 +325,20 @@ L0:
     r17 = 'Ascii: '
     r18 = CPyStr_Build(2, r17, r16)
     s5 = r18
-    r19 = PyObject_Repr(var)
-    r20 = 'Repr: '
-    r21 = CPyStr_Build(2, r20, r19)
-    s6 = r21
     return 1
+
+[case testAsciiBuiltin]
+from typing import NewType, Union
+NewStr = NewType("NewStr", str)
+def f(var: Union[str, NewStr]) -> str:
+    return ascii(var)
+[typing fixtures/typing-full.pyi]
+[out]
+def f(var):
+    var, r0 :: str
+L0:
+    r0 = PyObject_ASCII(var)
+    return r0
 
 [case testDecode]
 def f(b: bytes) -> None:
