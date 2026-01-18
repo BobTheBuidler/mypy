@@ -70,6 +70,7 @@ def generate_format_ops(specifiers: list[ConversionSpecifier]) -> list[FormatOp]
     format_ops = []
     for spec in specifiers:
         # TODO: Match specifiers instead of using whole_seq
+        # Conversion flags for str.format/f-strings (e.g. {!a}); only if no format spec.
         if spec.conversion and not spec.format_spec:
             format_op = conversion_map.get(spec.conversion)
             if format_op is None:
