@@ -52,34 +52,36 @@ def generate_format_ops(specifiers: list[ConversionSpecifier]) -> list[FormatOp]
 
     Different ConversionSpecifiers may share a same FormatOp.
     """
+    # Conversion flags for str.format/f-strings (e.g. {!a}/{!r}); only if no format spec.
+    conversion_map = {
+        "!a": FormatOp.ASCII,
+        "!r": FormatOp.REPR,
+    }
+    # printf-style tokens and special f-string lowering patterns.
+    whole_seq_map = {
+        "%s": FormatOp.STR,
+        "{:{}}": FormatOp.STR,
+        "%d": FormatOp.INT,
+        "%a": FormatOp.ASCII,
+        "%r": FormatOp.REPR,
+        "%b": FormatOp.BYTES,
+    }
+
     format_ops = []
     for spec in specifiers:
         # TODO: Match specifiers instead of using whole_seq
-        # Conversion flags for str.format/f-strings (e.g. {!a}/{!r}); only if no format spec.
         if spec.conversion and not spec.format_spec:
-            if spec.conversion == "!a":
-                format_op = FormatOp.ASCII
-            elif spec.conversion == "!r":
-                format_op = FormatOp.REPR
-            else:
+            format_op = conversion_map.get(spec.conversion)
+            if format_op is None:
                 return None
-        # printf-style tokens and special f-string lowering patterns.
-        elif spec.whole_seq == "%s" or spec.whole_seq == "{:{}}":
-            format_op = FormatOp.STR
-        elif spec.whole_seq == "%d":
-            format_op = FormatOp.INT
-        elif spec.whole_seq == "%a":
-            format_op = FormatOp.ASCII
-        elif spec.whole_seq == "%r":
-            format_op = FormatOp.REPR
-        elif spec.whole_seq == "%b":
-            format_op = FormatOp.BYTES
-        # Any other non-empty spec means we can't optimize; fall back to runtime formatting.
-        elif spec.whole_seq:
-            return None
-        # Empty spec ("{}") defaults to str().
         else:
-            format_op = FormatOp.STR
+            format_op = whole_seq_map.get(spec.whole_seq)
+            if format_op is None:
+                # Any other non-empty spec means we can't optimize; fall back to runtime formatting.
+                if spec.whole_seq:
+                    return None
+                # Empty spec ("{}") defaults to str().
+                format_op = FormatOp.STR
         format_ops.append(format_op)
     return format_ops
 
