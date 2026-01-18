@@ -29,6 +29,7 @@ files = [
     "irbuild-dict.test",
     "irbuild-set.test",
     "irbuild-str.test",
+    "irbuild-int-base-format.test",
     "irbuild-bytes.test",
     "irbuild-float.test",
     "irbuild-frozenset.test",

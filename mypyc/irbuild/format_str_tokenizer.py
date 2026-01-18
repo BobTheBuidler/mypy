@@ -16,6 +16,7 @@ from mypy.nodes import Context, Expression
 from mypy.options import Options
 from mypyc.ir.ops import Integer, Value
 from mypyc.ir.rtypes import (
+    c_int_rprimitive,
     c_pyssize_t_rprimitive,
     is_bytes_rprimitive,
     is_int_rprimitive,
@@ -25,7 +26,7 @@ from mypyc.ir.rtypes import (
 from mypyc.irbuild.builder import IRBuilder
 from mypyc.irbuild.constant_fold import constant_fold_expr
 from mypyc.primitives.bytes_ops import bytes_build_op
-from mypyc.primitives.int_ops import int_to_str_op
+from mypyc.primitives.int_ops import int_to_str_base_op, int_to_str_op
 from mypyc.primitives.str_ops import ascii_op, repr_op, str_build_op, str_op
 
 
@@ -42,6 +43,10 @@ class FormatOp(Enum):
 
     STR = "s"
     INT = "d"
+    INT_BIN = "bin"
+    INT_OCT = "oct"
+    INT_HEX = "hex"
+    INT_HEX_UPPER = "HEX"
     ASCII = "a"
     REPR = "r"
     BYTES = "b"
@@ -60,8 +65,17 @@ def generate_format_ops(specifiers: list[ConversionSpecifier]) -> list[FormatOp]
     # printf-style tokens and special f-string lowering patterns.
     whole_seq_map = {
         "%s": FormatOp.STR,
+        ":s": FormatOp.STR,
         "{:{}}": FormatOp.STR,
         "%d": FormatOp.INT,
+        ":d": FormatOp.INT,
+        "%x": FormatOp.INT_HEX,
+        "%X": FormatOp.INT_HEX_UPPER,
+        "%o": FormatOp.INT_OCT,
+        ":x": FormatOp.INT_HEX,
+        ":X": FormatOp.INT_HEX_UPPER,
+        ":o": FormatOp.INT_OCT,
+        ":b": FormatOp.INT_BIN,
         "%a": FormatOp.ASCII,
         "%r": FormatOp.REPR,
         "%b": FormatOp.BYTES,
@@ -70,7 +84,6 @@ def generate_format_ops(specifiers: list[ConversionSpecifier]) -> list[FormatOp]
     format_ops = []
     for spec in specifiers:
         # TODO: Match specifiers instead of using whole_seq
-        # Conversion flags for str.format/f-strings (e.g. {!a}); only if no format spec.
         if spec.conversion and not spec.format_spec:
             format_op = conversion_map.get(spec.conversion)
             if format_op is None:
@@ -187,6 +200,39 @@ def convert_format_expr_to_str(
                 var_str = builder.load_literal_value(str(folded))
             elif is_int_rprimitive(node_type) or is_short_int_rprimitive(node_type):
                 var_str = builder.primitive_op(int_to_str_op, [builder.accept(x)], line)
+            else:
+                return None
+        elif format_op in (
+            FormatOp.INT_BIN,
+            FormatOp.INT_OCT,
+            FormatOp.INT_HEX,
+            FormatOp.INT_HEX_UPPER,
+        ):
+            if isinstance(folded := constant_fold_expr(builder, x), int):
+                fmt = {
+                    FormatOp.INT_BIN: "b",
+                    FormatOp.INT_OCT: "o",
+                    FormatOp.INT_HEX: "x",
+                    FormatOp.INT_HEX_UPPER: "X",
+                }[format_op]
+                var_str = builder.load_literal_value(format(folded, fmt))
+            elif is_int_rprimitive(node_type) or is_short_int_rprimitive(node_type):
+                base = {
+                    FormatOp.INT_BIN: 2,
+                    FormatOp.INT_OCT: 8,
+                    FormatOp.INT_HEX: 16,
+                    FormatOp.INT_HEX_UPPER: 16,
+                }[format_op]
+                uppercase = format_op == FormatOp.INT_HEX_UPPER
+                var_str = builder.primitive_op(
+                    int_to_str_base_op,
+                    [
+                        builder.accept(x),
+                        Integer(base, c_int_rprimitive),
+                        Integer(1 if uppercase else 0, c_int_rprimitive),
+                    ],
+                    line,
+                )
             else:
                 return None
         else:

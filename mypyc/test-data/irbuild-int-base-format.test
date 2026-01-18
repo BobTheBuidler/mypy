@@ -1,0 +1,96 @@
+[case testIntBaseFormattingCStyle]
+def f(num: int) -> None:
+    s1 = "Hex: %x" % num
+    s2 = "HEX: %X" % num
+    s3 = "Oct: %o" % num
+[typing fixtures/typing-full.pyi]
+[out]
+def f(num):
+    num :: int
+    r0, r1, r2, s1, r3, r4, r5, s2, r6, r7, r8, s3 :: str
+L0:
+    r0 = CPyTagged_StrBase(num, 16, 0)
+    r1 = 'Hex: '
+    r2 = CPyStr_Build(2, r1, r0)
+    s1 = r2
+    r3 = CPyTagged_StrBase(num, 16, 1)
+    r4 = 'HEX: '
+    r5 = CPyStr_Build(2, r4, r3)
+    s2 = r5
+    r6 = CPyTagged_StrBase(num, 8, 0)
+    r7 = 'Oct: '
+    r8 = CPyStr_Build(2, r7, r6)
+    s3 = r8
+    return 1
+
+[case testIntBaseFormatMethod]
+def f(num: int) -> None:
+    s1 = "{:x}".format(num)
+    s2 = "{:X}".format(num)
+    s3 = "{:o}".format(num)
+    s4 = "{:b}".format(num)
+[typing fixtures/typing-full.pyi]
+[out]
+def f(num):
+    num :: int
+    r0, r1, s1, r2, r3, s2, r4, r5, s3, r6, r7, s4 :: str
+L0:
+    r0 = CPyTagged_StrBase(num, 16, 0)
+    r1 = CPyStr_Build(1, r0)
+    s1 = r1
+    r2 = CPyTagged_StrBase(num, 16, 1)
+    r3 = CPyStr_Build(1, r2)
+    s2 = r3
+    r4 = CPyTagged_StrBase(num, 8, 0)
+    r5 = CPyStr_Build(1, r4)
+    s3 = r5
+    r6 = CPyTagged_StrBase(num, 2, 0)
+    r7 = CPyStr_Build(1, r6)
+    s4 = r7
+    return 1
+
+[case testIntBaseFormatConstantFold]
+from typing import Final
+
+FMT_X: Final = "{:x}"
+FMT_XU: Final = "{:X}"
+FMT_O: Final = "{:o}"
+FMT_B: Final = "{:b}"
+
+def hx() -> str:
+    return FMT_X.format(255)
+
+def hx_u() -> str:
+    return FMT_XU.format(255)
+
+def ho() -> str:
+    return FMT_O.format(255)
+
+def hb() -> str:
+    return FMT_B.format(10)
+[typing fixtures/typing-full.pyi]
+[out]
+def hx():
+    r0, r1 :: str
+L0:
+    r0 = 'ff'
+    r1 = CPyStr_Build(1, r0)
+    return r1
+def hx_u():
+    r0, r1 :: str
+L0:
+    r0 = 'FF'
+    r1 = CPyStr_Build(1, r0)
+    return r1
+def ho():
+    r0, r1 :: str
+L0:
+    r0 = '377'
+    r1 = CPyStr_Build(1, r0)
+    return r1
+def hb():
+    r0, r1 :: str
+L0:
+    r0 = '1010'
+    r1 = CPyStr_Build(1, r0)
+    return r1

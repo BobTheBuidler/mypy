@@ -21,6 +21,7 @@ from mypyc.ir.rtypes import (
     RType,
     bit_rprimitive,
     bool_rprimitive,
+    c_int_rprimitive,
     c_pyssize_t_rprimitive,
     float_rprimitive,
     int16_rprimitive,
@@ -103,6 +104,13 @@ for name in ("builtins.str", "builtins.repr"):
         error_kind=ERR_MAGIC,
         priority=3,
     )
+
+int_to_str_base_op = custom_op(
+    arg_types=[int_rprimitive, c_int_rprimitive, c_int_rprimitive],
+    return_type=str_rprimitive,
+    c_function_name="CPyTagged_StrBase",
+    error_kind=ERR_MAGIC,
+)
 
 
 def int_binary_primitive(
