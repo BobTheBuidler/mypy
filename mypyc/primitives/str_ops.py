@@ -43,7 +43,7 @@ str_op = function_op(
 )
 
 # repr(obj)
-function_op(
+repr_op = function_op(
     name="builtins.repr",
     arg_types=[object_rprimitive],
     return_type=str_rprimitive,
