@@ -91,6 +91,7 @@ class ClassIR:
         module_name: str,
         is_trait: bool = False,
         is_generated: bool = False,
+        is_environment: bool = False,
         is_abstract: bool = False,
         is_ext_class: bool = True,
         is_final_class: bool = False,
@@ -100,7 +101,7 @@ class ClassIR:
         self.is_trait = is_trait
         self.is_generated = is_generated
         # Environment classes represent locals and should emit UnboundLocalError for missing vars.
-        self.is_environment = False
+        self.is_environment = is_environment
         self.is_abstract = is_abstract
         self.is_ext_class = is_ext_class
         self.is_final_class = is_final_class
