@@ -584,17 +584,65 @@ def translate_sum_call(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> V
 @specialize_function("attr.ib")
 @specialize_function("attr.attrib")
 @specialize_function("attr.Factory")
-def translate_dataclass_field_call(
+def translate_dataclasses_field_call(
     builder: IRBuilder, expr: CallExpr, callee: RefExpr
 ) -> Value | None:
-    args = expr.args
-    if len(args) != 1 or expr.arg_kinds[0] != ARG_POS:
+    if callee.fullname == "attr.Factory":
+        # attr.Factory returns a callable for default factories, so we need to check if
+        # we're calling it from inside attr.ib.
+        if (
+            not (
+                len(expr.args) == 1
+                and expr.arg_kinds == [ARG_POS]
+                and isinstance(expr.args[0], NameExpr)
+                and expr.args[0].fullname == "attr.ib"
+            )
+            and not expr.args and isinstance(expr.callee, MemberExpr)
+        ):
+            # This is a call of attr.Factory that returns a callable. We can't translate it now.
+            return None
+
+    # kwargs that map to boolean attributes on a mypyc-compiled ClassIR
+    bool_args = ["init", "repr", "hash", "eq", "order", "frozen"]
+    if callee.fullname == "attr.Factory":
+        # this is either an attr.Factory() call or it's an attr.Factory call
+        if len(expr.args) >= 1 and expr.arg_kinds[0] == ARG_POS:
+            val = expr.args[0]
+        else:
+            return None
+    elif len(expr.args) >= 1 and expr.arg_kinds[0] == ARG_NAMED and expr.arg_names[0] == "default":
+        # attr.ib(default=...) or attr.attrib(default=...)
+        val = expr.args[0]
+    elif len(expr.args) >= 1 and expr.arg_kinds[0] == ARG_POS:
+        # dataclasses.field(default) or attr.ib(default)
+        val = expr.args[0]
+    else:
+        # dataclasses.field() or attr.ib()
         return None
-    arg = expr.args[0]
-    arg_type = builder.node_type(arg)
-    if not (isinstance(arg, StrExpr) and arg_type.is_str):
+
+    # If it is not a constant, can't translate now
+    if not isinstance(val, (IntExpr, StrExpr)):
         return None
-    return builder.call_c(PrimitiveDescription("CPyDataclassField", str_rprimitive), [arg], expr.line)
+
+    # If there is a kwarg that is not a boolean attribute, we can't translate
+    if len(expr.arg_kinds) > 1:
+        for name, kind in zip(expr.arg_names[1:], expr.arg_kinds[1:]):
+            if kind != ARG_NAMED or name not in bool_args:
+                return None
+
+    # Return a dictionary of attributes. We use a dict instead of mypyc_attr
+    # to avoid issues with using non-string literal keys.
+    items = []
+    for name, kind in zip(expr.arg_names[1:], expr.arg_kinds[1:]):
+        if kind == ARG_NAMED:
+            # Save boolean args in the dict
+            items.append((StrExpr(name), expr.args[expr.arg_names.index(name)]))
+
+    # Add default
+    items.append((StrExpr("default"), val))
+
+    dict_expr = DictExpr(items)
+    return builder.accept(dict_expr)
 
 
 @specialize_function("builtins.ascii")
@@ -605,260 +653,27 @@ def translate_ascii(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Valu
     return builder.primitive_op(ascii_op, [arg], expr.line)
 
 
-@specialize_function("builtins.ord")
-def translate_ord(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
-    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
-        return None
-    arg_expr = expr.args[0]
-    arg = constant_fold_expr(builder, arg_expr)
-    if isinstance(arg, (str, bytes)) and len(arg) == 1:
-        return Integer(ord(arg))
-
-    # Check for ord(s[i]) where s is str and i is an integer
-    if isinstance(arg_expr, IndexExpr):
-        # Check base type
-        base_type = builder.node_type(arg_expr.base)
-        if is_str_rprimitive(base_type):
-            # Check index type
-            index_expr = arg_expr.index
-            index_type = builder.node_type(index_expr)
-            if is_tagged(index_type) or is_fixed_width_rtype(index_type):
-                # This is ord(s[i]) where s is str and i is an integer.
-                # Generate specialized inline code using the helper.
-                result = translate_getitem_with_bounds_check(
-                    builder,
-                    arg_expr.base,
-                    [arg_expr.index],
-                    expr,
-                    str_adjust_index_op,
-                    str_range_check_op,
-                    str_get_item_unsafe_as_int_op,
-                )
-                return result
-
+@specialize_function("builtins.next")
+def translate_next_call(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    # Special case next(x, default).
+    if len(expr.args) == 2 and expr.arg_kinds[0] == ARG_POS and expr.arg_kinds[1] == ARG_POS:
+        iter_reg = builder.accept(expr.args[0])
+        # Call actual function rather than method so it handles both iterator
+        # and iterator-like
+        next_reg = builder.call_c(iter_next_op, [iter_reg], expr.line)
+        # Unlike the normal python semantics, the error value is None, not
+        # the exception. This is an optimization that we can do because
+        # mypyc-specific mypy prevents the exception from escaping.
+        if isinstance(next_reg, Call) and next_reg.error_kind == Call.ERR_MAGIC:
+            none_reg = builder.none()
+            builder.assign(next_reg.error_value, none_reg, expr.line)
+        return builder.coerce(next_reg, builder.node_type(expr), expr.line)
     return None
 
 
-def is_object(callee: RefExpr) -> bool:
-    """Returns True for object.<name> calls."""
-    return (
-        isinstance(callee, MemberExpr)
-        and isinstance(callee.expr, NameExpr)
-        and callee.expr.fullname == "builtins.object"
-    )
-
-
-def is_super_or_object(expr: CallExpr, callee: RefExpr) -> bool:
-    """Returns True for super().<name> or object.<name> calls."""
-    return isinstance(expr.callee, SuperExpr) or is_object(callee)
-
-
-@specialize_function("__new__", object_rprimitive)
-def translate_object_new(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
-    fn = builder.fn_info
-    if fn.name != "__new__" or not is_super_or_object(expr, callee):
-        return None
-
-    ir = builder.get_current_class_ir()
-    if ir is None:
-        return None
-
-    call = '"object.__new__()"'
-    if not ir.is_ext_class:
-        builder.error(f"{call} not supported for non-extension classes", expr.line)
-        return None
-    if ir.inherits_python:
-        builder.error(
-            f"{call} not supported for classes inheriting from non-native classes", expr.line
-        )
-        return None
-    if len(expr.args) != 1:
-        builder.error(f"{call} supported only with 1 argument, got {len(expr.args)}", expr.line)
-        return None
-
-    typ_arg = expr.args[0]
-    method_args = fn.fitem.arg_names
-    if isinstance(typ_arg, NameExpr) and len(method_args) > 0 and method_args[0] == typ_arg.name:
-        subtype = builder.accept(expr.args[0])
-        subs = ir.subclasses()
-        if subs is not None and len(subs) == 0:
-            return builder.add(Call(ir.setup, [subtype], expr.line))
-        # Call a function that dynamically resolves the setup function of extension classes from the type object.
-        # This is necessary because the setup involves default attribute initialization and setting up
-        # the vtable which are specific to a given type and will not work if a subtype is created using
-        # the setup function of its base.
-        return builder.call_c(setup_object, [subtype], expr.line)
-
-    return None
-
-
-@specialize_function("__setattr__", object_rprimitive)
-def translate_object_setattr(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
-    is_super = isinstance(expr.callee, SuperExpr)
-    is_object_callee = is_object(callee)
-    if not ((is_super and len(expr.args) >= 2) or (is_object_callee and len(expr.args) >= 3)):
-        return None
-
-    self_reg = builder.accept(expr.args[0]) if is_object_callee else builder.self()
-    ir = builder.get_current_class_ir()
-    if ir and (not ir.is_ext_class or ir.builtin_base or ir.inherits_python):
-        return None
-    # Need to offset by 1 for super().__setattr__ calls because there is no self arg in this case.
-    name_idx = 0 if is_super else 1
-    value_idx = 1 if is_super else 2
-    attr_name = expr.args[name_idx]
-    attr_value = expr.args[value_idx]
-    value = builder.accept(attr_value)
-
-    if isinstance(attr_name, StrExpr) and ir and ir.has_attr(attr_name.value):
-        name = attr_name.value
-        value = builder.coerce(value, ir.attributes[name], expr.line)
-        return builder.add(SetAttr(self_reg, name, value, expr.line))
-
-    name_reg = builder.accept(attr_name)
-    return builder.call_c(generic_setattr, [self_reg, name_reg, value], expr.line)
-
-
-def translate_getitem_with_bounds_check(
-    builder: IRBuilder,
-    base_expr: Expression,
-    args: list[Expression],
-    ctx_expr: Expression,
-    adjust_index_op: PrimitiveDescription,
-    range_check_op: PrimitiveDescription,
-    get_item_unsafe_op: PrimitiveDescription,
-) -> Value | None:
-    """Shared helper for optimized __getitem__ with bounds checking.
-
-    This implements the common pattern of:
-    1. Adjusting negative indices
-    2. Checking if index is in valid range
-    3. Raising IndexError if out of range
-    4. Getting the item if in range
-
-    Args:
-        builder: The IR builder
-        base_expr: The base object expression
-        args: The arguments to __getitem__ (should be length 1)
-        ctx_expr: The context expression for line numbers
-        adjust_index_op: Primitive op to adjust negative indices
-        range_check_op: Primitive op to check if index is in valid range
-        get_item_unsafe_op: Primitive op to get item (no bounds checking)
-
-    Returns:
-        The result value, or None if optimization doesn't apply
-    """
-    # Check that we have exactly one argument
-    if len(args) != 1:
-        return None
-
-    # Get the object
-    obj = builder.accept(base_expr)
-
-    # Get the index argument
-    index = builder.accept(args[0])
-
-    # Adjust the index (handle negative indices)
-    adjusted_index = builder.primitive_op(adjust_index_op, [obj, index], ctx_expr.line)
-
-    # Check if the adjusted index is in valid range
-    range_check = builder.primitive_op(range_check_op, [obj, adjusted_index], ctx_expr.line)
-
-    # Create blocks for branching
-    valid_block = BasicBlock()
-    invalid_block = BasicBlock()
-
-    builder.add_bool_branch(range_check, valid_block, invalid_block)
-
-    # Handle invalid index - raise IndexError
-    builder.activate_block(invalid_block)
-    builder.add(
-        RaiseStandardError(RaiseStandardError.INDEX_ERROR, "index out of range", ctx_expr.line)
-    )
-    builder.add(Unreachable())
-
-    # Handle valid index - get the item
-    builder.activate_block(valid_block)
-    result = builder.primitive_op(get_item_unsafe_op, [obj, adjusted_index], ctx_expr.line)
-
-    return result
-
-
-@specialize_dunder("__getitem__", bytes_writer_rprimitive)
-def translate_bytes_writer_get_item(
-    builder: IRBuilder, base_expr: Expression, args: list[Expression], ctx_expr: Expression
-) -> Value | None:
-    """Optimized BytesWriter.__getitem__ implementation with bounds checking."""
-    return translate_getitem_with_bounds_check(
-        builder,
-        base_expr,
-        args,
-        ctx_expr,
-        bytes_writer_adjust_index_op,
-        bytes_writer_range_check_op,
-        bytes_writer_get_item_unsafe_op,
-    )
-
-
-@specialize_dunder("__setitem__", bytes_writer_rprimitive)
-def translate_bytes_writer_set_item(
-    builder: IRBuilder, base_expr: Expression, args: list[Expression], ctx_expr: Expression
-) -> Value | None:
-    """Optimized BytesWriter.__setitem__ implementation with bounds checking."""
-    # Check that we have exactly two arguments (index and value)
-    if len(args) != 2:
-        return None
-
-    # Get the BytesWriter object
-    obj = builder.accept(base_expr)
-
-    # Get the index and value arguments
-    index = builder.accept(args[0])
-    value = builder.accept(args[1])
-
-    # Adjust the index (handle negative indices)
-    adjusted_index = builder.primitive_op(
-        bytes_writer_adjust_index_op, [obj, index], ctx_expr.line
-    )
-
-    # Check if the adjusted index is in valid range
-    range_check = builder.primitive_op(
-        bytes_writer_range_check_op, [obj, adjusted_index], ctx_expr.line
-    )
-
-    # Create blocks for branching
-    valid_block = BasicBlock()
-    invalid_block = BasicBlock()
-
-    builder.add_bool_branch(range_check, valid_block, invalid_block)
-
-    # Handle invalid index - raise IndexError
-    builder.activate_block(invalid_block)
-    builder.add(
-        RaiseStandardError(RaiseStandardError.INDEX_ERROR, "index out of range", ctx_expr.line)
-    )
-    builder.add(Unreachable())
-
-    # Handle valid index - set the item
-    builder.activate_block(valid_block)
-    builder.primitive_op(
-        bytes_writer_set_item_unsafe_op, [obj, adjusted_index, value], ctx_expr.line
-    )
-
-    return builder.none()
-
-
-@specialize_dunder("__getitem__", bytes_rprimitive)
-def translate_bytes_get_item(
-    builder: IRBuilder, base_expr: Expression, args: list[Expression], ctx_expr: Expression
-) -> Value | None:
-    """Optimized bytes.__getitem__ implementation with bounds checking."""
-    return translate_getitem_with_bounds_check(
-        builder,
-        base_expr,
-        args,
-        ctx_expr,
-        bytes_adjust_index_op,
-        bytes_range_check_op,
-        bytes_get_item_unsafe_op,
-    )
+@specialize_function("builtins.isinstance")
+def translate_isinstance(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    # Special case isinstance(x, t) when t is a native class. Avoid
+diff --git a/mypyc/irbuild/specialize.py b/mypyc/irbuild/specialize.py
+index fe189fd92..6f87e97e3 100644
+Binary files a/mypyc/irbuild/specialize.py and b/mypyc/irbuild/specialize.py differ
