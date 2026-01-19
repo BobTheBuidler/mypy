@@ -23,6 +23,22 @@ from mypyc.namegen import NameGenerator
 
 
 class TestPformatDeterministic(unittest.TestCase):
+    def test_dict_entries_sorted(self) -> None:
+        literal_a = {"b": 2, "a": 1}
+        literal_b = {"a": 1, "b": 2}
+        expected = "{'a': 1, 'b': 2}"
+
+        assert pformat_deterministic(literal_a, 80) == expected
+        assert pformat_deterministic(literal_b, 80) == expected
+
+    def test_set_elements_sorted(self) -> None:
+        literal_a = {2, 1}
+        literal_b = {1, 2}
+        expected = "{1, 2}"
+
+        assert pformat_deterministic(literal_a, 80) == expected
+        assert pformat_deterministic(literal_b, 80) == expected
+
     def test_frozenset_elements_sorted(self) -> None:
         fs_small = frozenset({("a", 1)})
         fs_large = frozenset({("a", 1), ("b", 2)})

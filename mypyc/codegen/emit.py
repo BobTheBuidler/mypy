@@ -1332,21 +1332,28 @@ class _DeterministicPrettyPrinter(pprint.PrettyPrinter):
     _indent_per_level: int
 
     def format(
-        self, obj: object, context: dict[int, int], maxlevels: int, level: int
+        self, obj: object, context: dict[int, int], maxlevels: int | None, level: int
     ) -> tuple[str, bool, bool]:
+        maxlevels_int = sys.maxsize if maxlevels is None else maxlevels
         if isinstance(obj, dict) and type(obj).__repr__ is dict.__repr__:
-            return self._safe_dict_repr(cast(dict[object, object], obj), context, maxlevels, level)
+            return self._safe_dict_repr(
+                cast(dict[object, object], obj), context, maxlevels_int, level
+            )
         if isinstance(obj, (set, frozenset)) and type(obj).__repr__ in (
             set.__repr__,
             frozenset.__repr__,
         ):
             return self._safe_set_repr(
-                cast(set[object] | frozenset[object], obj), context, maxlevels, level
+                cast(set[object] | frozenset[object], obj), context, maxlevels_int, level
             )
-        return super().format(obj, context, maxlevels, level)
+        return super().format(obj, context, maxlevels_int, level)
 
     def _safe_dict_repr(
-        self, obj: dict[object, object], context: dict[int, int], maxlevels: int, level: int
+        self,
+        obj: dict[object, object],
+        context: dict[int, int],
+        maxlevels: int,
+        level: int,
     ) -> tuple[str, bool, bool]:
         if not obj:
             return "{}", True, False
