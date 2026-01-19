@@ -45,9 +45,9 @@ class TestPformatDeterministic(unittest.TestCase):
         assert pformat_deterministic(literal_b, 120) == expected
 
     def test_restores_default_safe_key(self) -> None:
-        original_safe_key = pprint._safe_key
+        original_safe_key = getattr(pprint, "_safe_key", None)
         pformat_deterministic({"key": "value"}, 80)
-        assert pprint._safe_key is original_safe_key
+        assert getattr(pprint, "_safe_key", None) is original_safe_key
 
 
 class TestEmitter(unittest.TestCase):
