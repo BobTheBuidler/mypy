@@ -587,62 +587,14 @@ def translate_sum_call(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> V
 def translate_dataclasses_field_call(
     builder: IRBuilder, expr: CallExpr, callee: RefExpr
 ) -> Value | None:
-    if callee.fullname == "attr.Factory":
-        # attr.Factory returns a callable for default factories, so we need to check if
-        # we're calling it from inside attr.ib.
-        if (
-            not (
-                len(expr.args) == 1
-                and expr.arg_kinds == [ARG_POS]
-                and isinstance(expr.args[0], NameExpr)
-                and expr.args[0].fullname == "attr.ib"
-            )
-            and not expr.args and isinstance(expr.callee, MemberExpr)
-        ):
-            # This is a call of attr.Factory that returns a callable. We can't translate it now.
-            return None
-
-    # kwargs that map to boolean attributes on a mypyc-compiled ClassIR
-    bool_args = ["init", "repr", "hash", "eq", "order", "frozen"]
-    if callee.fullname == "attr.Factory":
-        # this is either an attr.Factory() call or it's an attr.Factory call
-        if len(expr.args) >= 1 and expr.arg_kinds[0] == ARG_POS:
-            val = expr.args[0]
-        else:
-            return None
-    elif len(expr.args) >= 1 and expr.arg_kinds[0] == ARG_NAMED and expr.arg_names[0] == "default":
-        # attr.ib(default=...) or attr.attrib(default=...)
-        val = expr.args[0]
-    elif len(expr.args) >= 1 and expr.arg_kinds[0] == ARG_POS:
-        # dataclasses.field(default) or attr.ib(default)
-        val = expr.args[0]
-    else:
-        # dataclasses.field() or attr.ib()
-        return None
-
-    # If it is not a constant, can't translate now
-    if not isinstance(val, (IntExpr, StrExpr)):
-        return None
-
-    # If there is a kwarg that is not a boolean attribute, we can't translate
-    if len(expr.arg_kinds) > 1:
-        for name, kind in zip(expr.arg_names[1:], expr.arg_kinds[1:]):
-            if kind != ARG_NAMED or name not in bool_args:
-                return None
-
-    # Return a dictionary of attributes. We use a dict instead of mypyc_attr
-    # to avoid issues with using non-string literal keys.
-    items = []
-    for name, kind in zip(expr.arg_names[1:], expr.arg_kinds[1:]):
-        if kind == ARG_NAMED:
-            # Save boolean args in the dict
-            items.append((StrExpr(name), expr.args[expr.arg_names.index(name)]))
-
-    # Add default
-    items.append((StrExpr("default"), val))
-
-    dict_expr = DictExpr(items)
-    return builder.accept(dict_expr)
+    """Special case for 'dataclasses.field', 'attr.attrib', and 'attr.Factory'
+    function calls because the results of such calls are type-checked
+    by mypy using the types of the arguments to their respective
+    functions, resulting in attempted coercions by mypyc that throw a
+    runtime error.
+    """
+    builder.types[expr] = AnyType(TypeOfAny.from_error)
+    return None
 
 
 @specialize_function("builtins.ascii")
@@ -655,25 +607,790 @@ def translate_ascii(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Valu
 
 @specialize_function("builtins.next")
 def translate_next_call(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
-    # Special case next(x, default).
-    if len(expr.args) == 2 and expr.arg_kinds[0] == ARG_POS and expr.arg_kinds[1] == ARG_POS:
-        iter_reg = builder.accept(expr.args[0])
-        # Call actual function rather than method so it handles both iterator
-        # and iterator-like
-        next_reg = builder.call_c(iter_next_op, [iter_reg], expr.line)
-        # Unlike the normal python semantics, the error value is None, not
-        # the exception. This is an optimization that we can do because
-        # mypyc-specific mypy prevents the exception from escaping.
-        if isinstance(next_reg, Call) and next_reg.error_kind == Call.ERR_MAGIC:
-            none_reg = builder.none()
-            builder.assign(next_reg.error_value, none_reg, expr.line)
-        return builder.coerce(next_reg, builder.node_type(expr), expr.line)
-    return None
+    """Special case for calling next() on a generator expression, an
+    idiom that shows up some in mypy.
+
+    For example, next(x for x in l if x.id == 12, None) will
+    generate code that searches l for an element where x.id == 12
+    and produce the first such object, or None if no such element
+    exists.
+    """
+    if not (
+        expr.arg_kinds in ([ARG_POS], [ARG_POS, ARG_POS])
+        and isinstance(expr.args[0], GeneratorExpr)
+    ):
+        return None
+
+    gen = expr.args[0]
+    retval = Register(builder.node_type(expr))
+    default_val = builder.accept(expr.args[1]) if len(expr.args) > 1 else None
+    exit_block = BasicBlock()
+
+    def gen_inner_stmts() -> None:
+        # next takes the first element of the generator, so if
+        # something gets produced, we are done.
+        builder.assign(retval, builder.accept(gen.left_expr), gen.left_expr.line)
+        builder.goto(exit_block)
+
+    loop_params = list(zip(gen.indices, gen.sequences, gen.condlists, gen.is_async))
+    comprehension_helper(builder, loop_params, gen_inner_stmts, gen.line)
+
+    # Now we need the case for when nothing got hit. If there was
+    # a default value, we produce it, and otherwise we raise
+    # StopIteration.
+    if default_val:
+        builder.assign(retval, default_val, gen.left_expr.line)
+        builder.goto(exit_block)
+    else:
+        builder.add(RaiseStandardError(RaiseStandardError.STOP_ITERATION, None, expr.line))
+        builder.add(Unreachable())
+
+    builder.activate_block(exit_block)
+    return retval
+
+
+isinstance_primitives: Final = {
+    "builtins.bool": isinstance_bool,
+    "builtins.bytearray": isinstance_bytearray,
+    "builtins.bytes": isinstance_bytes,
+    "builtins.dict": isinstance_dict,
+    "builtins.float": isinstance_float,
+    "builtins.frozenset": isinstance_frozenset,
+    "builtins.int": isinstance_int,
+    "builtins.list": isinstance_list,
+    "builtins.set": isinstance_set,
+    "builtins.str": isinstance_str,
+    "builtins.tuple": isinstance_tuple,
+}
 
 
 @specialize_function("builtins.isinstance")
 def translate_isinstance(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
-    # Special case isinstance(x, t) when t is a native class. Avoid
-diff --git a/mypyc/irbuild/specialize.py b/mypyc/irbuild/specialize.py
-index fe189fd92..6f87e97e3 100644
-Binary files a/mypyc/irbuild/specialize.py and b/mypyc/irbuild/specialize.py differ
+    """Special case for builtins.isinstance.
+
+    Prevent coercions on the thing we are checking the instance of -
+    there is no need to coerce something to a new type before checking
+    what type it is, and the coercion could lead to bugs.
+    """
+    if not (len(expr.args) == 2 and expr.arg_kinds == [ARG_POS, ARG_POS]):
+        return None
+
+    obj_expr = expr.args[0]
+    type_expr = expr.args[1]
+
+    if isinstance(type_expr, TupleExpr) and not type_expr.items:
+        # we can compile this case to a noop
+        return builder.false()
+
+    if isinstance(type_expr, (RefExpr, TupleExpr)):
+        builder.types[obj_expr] = AnyType(TypeOfAny.from_error)
+
+        irs = builder.flatten_classes(type_expr)
+        if irs is not None:
+            can_borrow = all(
+                ir.is_ext_class and not ir.inherits_python and not ir.allow_interpreted_subclasses
+                for ir in irs
+            )
+            obj = builder.accept(obj_expr, can_borrow=can_borrow)
+            return builder.builder.isinstance_helper(obj, irs, expr.line)
+
+    if isinstance(type_expr, RefExpr):
+        node = type_expr.node
+        if node:
+            desc = isinstance_primitives.get(node.fullname)
+            if desc:
+                obj = builder.accept(obj_expr)
+                return builder.primitive_op(desc, [obj], expr.line)
+
+    elif isinstance(type_expr, TupleExpr):
+        node_names: list[str] = []
+        for item in type_expr.items:
+            if not isinstance(item, RefExpr):
+                return None
+            if item.node is None:
+                return None
+            if item.node.fullname not in node_names:
+                node_names.append(item.node.fullname)
+
+        descs = [isinstance_primitives.get(fullname) for fullname in node_names]
+        if None in descs:
+            # not all types are primitive types, abort
+            return None
+
+        obj = builder.accept(obj_expr)
+
+        retval = Register(bool_rprimitive)
+        pass_block = BasicBlock()
+        fail_block = BasicBlock()
+        exit_block = BasicBlock()
+
+        # Chain the checks: if any succeed, jump to pass_block; else, continue
+        for i, desc in enumerate(descs):
+            is_last = i == len(descs) - 1
+            next_block = fail_block if is_last else BasicBlock()
+            builder.add_bool_branch(
+                builder.primitive_op(cast(PrimitiveDescription, desc), [obj], expr.line),
+                pass_block,
+                next_block,
+            )
+            if not is_last:
+                builder.activate_block(next_block)
+
+        # If any check passed
+        builder.activate_block(pass_block)
+        builder.assign(retval, builder.true(), expr.line)
+        builder.goto(exit_block)
+
+        # If all checks failed
+        builder.activate_block(fail_block)
+        builder.assign(retval, builder.false(), expr.line)
+        builder.goto(exit_block)
+
+        # Return the result
+        builder.activate_block(exit_block)
+        return retval
+
+    return None
+
+
+@specialize_function("setdefault", dict_rprimitive)
+def translate_dict_setdefault(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    """Special case for 'dict.setdefault' which would only construct
+    default empty collection when needed.
+
+    The dict_setdefault_spec_init_op checks whether the dict contains
+    the key and would construct the empty collection only once.
+
+    For example, this specializer works for the following cases:
+         d.setdefault(key, set()).add(value)
+         d.setdefault(key, []).append(value)
+         d.setdefault(key, {})[inner_key] = inner_val
+    """
+    if (
+        len(expr.args) == 2
+        and expr.arg_kinds == [ARG_POS, ARG_POS]
+        and isinstance(callee, MemberExpr)
+    ):
+        arg = expr.args[1]
+        if isinstance(arg, ListExpr):
+            if len(arg.items):
+                return None
+            data_type = Integer(1, c_int_rprimitive, expr.line)
+        elif isinstance(arg, DictExpr):
+            if len(arg.items):
+                return None
+            data_type = Integer(2, c_int_rprimitive, expr.line)
+        elif (
+            isinstance(arg, CallExpr)
+            and isinstance(arg.callee, NameExpr)
+            and arg.callee.fullname == "builtins.set"
+        ):
+            if len(arg.args):
+                return None
+            data_type = Integer(3, c_int_rprimitive, expr.line)
+        else:
+            return None
+
+        callee_dict = builder.accept(callee.expr)
+        key_val = builder.accept(expr.args[0])
+        return builder.call_c(
+            dict_setdefault_spec_init_op, [callee_dict, key_val, data_type], expr.line
+        )
+    return None
+
+
+@specialize_function("format", str_rprimitive)
+def translate_str_format(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if isinstance(callee, MemberExpr):
+        folded_callee = constant_fold_expr(builder, callee.expr)
+        if isinstance(folded_callee, str) and expr.arg_kinds.count(ARG_POS) == len(expr.arg_kinds):
+            tokens = tokenizer_format_call(folded_callee)
+            if tokens is None:
+                return None
+            literals, format_ops = tokens
+            # Convert variables to strings
+            substitutions = convert_format_expr_to_str(builder, format_ops, expr.args, expr.line)
+            if substitutions is None:
+                return None
+            return join_formatted_strings(builder, literals, substitutions, expr.line)
+    return None
+
+
+@specialize_function("join", str_rprimitive)
+def translate_fstring(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    """Special case for f-string, which is translated into str.join()
+    in mypy AST.
+
+    This specializer optimizes simplest f-strings which don't contain
+    any format operation.
+    """
+    if (
+        isinstance(callee, MemberExpr)
+        and isinstance(callee.expr, StrExpr)
+        and callee.expr.value == ""
+        and expr.arg_kinds == [ARG_POS]
+        and isinstance(expr.args[0], ListExpr)
+    ):
+        for item in expr.args[0].items:
+            if isinstance(item, StrExpr):
+                continue
+            elif isinstance(item, CallExpr):
+                if not isinstance(item.callee, MemberExpr) or item.callee.name != "format":
+                    return None
+                elif (
+                    not isinstance(item.callee.expr, StrExpr) or item.callee.expr.value != "{:{}}"
+                ):
+                    return None
+
+                if not isinstance(item.args[1], StrExpr) or item.args[1].value != "":
+                    return None
+            else:
+                return None
+
+        format_ops = []
+        exprs: list[Expression] = []
+
+        for item in expr.args[0].items:
+            if isinstance(item, StrExpr) and item.value != "":
+                format_ops.append(FormatOp.STR)
+                exprs.append(item)
+            elif isinstance(item, CallExpr):
+                format_ops.append(FormatOp.STR)
+                exprs.append(item.args[0])
+
+        def get_literal_str(expr: Expression) -> str | None:
+            if isinstance(expr, StrExpr):
+                return expr.value
+            elif isinstance(expr, RefExpr) and isinstance(expr.node, Var) and expr.node.is_final:
+                final_value = expr.node.final_value
+                if final_value is not None:
+                    return str(final_value)
+            return None
+
+        for i in range(len(exprs) - 1):
+            while (
+                len(exprs) >= i + 2
+                and (first := get_literal_str(exprs[i])) is not None
+                and (second := get_literal_str(exprs[i + 1])) is not None
+            ):
+                exprs = [*exprs[:i], StrExpr(first + second), *exprs[i + 2 :]]
+                format_ops = [*format_ops[:i], FormatOp.STR, *format_ops[i + 2 :]]
+
+        substitutions = convert_format_expr_to_str(builder, format_ops, exprs, expr.line)
+        if substitutions is None:
+            return None
+
+        return join_formatted_strings(builder, None, substitutions, expr.line)
+    return None
+
+
+@specialize_function("encode", str_rprimitive)
+def str_encode_fast_path(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    """Specialize common cases of str.encode for most used encodings and strict errors."""
+
+    if not isinstance(callee, MemberExpr):
+        return None
+
+    # We can only specialize if we have string literals as args
+    if len(expr.arg_kinds) > 0 and not isinstance(expr.args[0], StrExpr):
+        return None
+    if len(expr.arg_kinds) > 1 and not isinstance(expr.args[1], StrExpr):
+        return None
+
+    encoding = "utf8"
+    errors = "strict"
+    if len(expr.arg_kinds) > 0 and isinstance(expr.args[0], StrExpr):
+        if expr.arg_kinds[0] == ARG_NAMED:
+            if expr.arg_names[0] == "encoding":
+                encoding = expr.args[0].value
+            elif expr.arg_names[0] == "errors":
+                errors = expr.args[0].value
+        elif expr.arg_kinds[0] == ARG_POS:
+            encoding = expr.args[0].value
+        else:
+            return None
+    if len(expr.arg_kinds) > 1 and isinstance(expr.args[1], StrExpr):
+        if expr.arg_kinds[1] == ARG_NAMED:
+            if expr.arg_names[1] == "encoding":
+                encoding = expr.args[1].value
+            elif expr.arg_names[1] == "errors":
+                errors = expr.args[1].value
+        elif expr.arg_kinds[1] == ARG_POS:
+            errors = expr.args[1].value
+        else:
+            return None
+
+    if errors != "strict":
+        # We can only specialize strict errors
+        return None
+
+    encoding = encoding.lower().replace("-", "").replace("_", "")  # normalize
+    # Specialized encodings and their accepted aliases
+    if encoding in ["u8", "utf", "utf8", "cp65001"]:
+        return builder.call_c(str_encode_utf8_strict, [builder.accept(callee.expr)], expr.line)
+    elif encoding in ["646", "ascii", "usascii"]:
+        return builder.call_c(str_encode_ascii_strict, [builder.accept(callee.expr)], expr.line)
+    elif encoding in ["iso88591", "8859", "cp819", "latin", "latin1", "l1"]:
+        return builder.call_c(str_encode_latin1_strict, [builder.accept(callee.expr)], expr.line)
+
+    return None
+
+
+@specialize_function("decode", bytes_rprimitive)
+def bytes_decode_fast_path(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    """Specialize common cases of obj.decode for most used encodings and strict errors."""
+
+    if not isinstance(callee, MemberExpr):
+        return None
+
+    # We can only specialize if we have string literals as args
+    if len(expr.arg_kinds) > 0 and not isinstance(expr.args[0], StrExpr):
+        return None
+    if len(expr.arg_kinds) > 1 and not isinstance(expr.args[1], StrExpr):
+        return None
+
+    encoding = "utf8"
+    errors = "strict"
+    if len(expr.arg_kinds) > 0 and isinstance(expr.args[0], StrExpr):
+        if expr.arg_kinds[0] == ARG_NAMED:
+            if expr.arg_names[0] == "encoding":
+                encoding = expr.args[0].value
+            elif expr.arg_names[0] == "errors":
+                errors = expr.args[0].value
+        elif expr.arg_kinds[0] == ARG_POS:
+            encoding = expr.args[0].value
+        else:
+            return None
+    if len(expr.arg_kinds) > 1 and isinstance(expr.args[1], StrExpr):
+        if expr.arg_kinds[1] == ARG_NAMED:
+            if expr.arg_names[1] == "encoding":
+                encoding = expr.args[1].value
+            elif expr.arg_names[1] == "errors":
+                errors = expr.args[1].value
+        elif expr.arg_kinds[1] == ARG_POS:
+            errors = expr.args[1].value
+        else:
+            return None
+
+    if errors != "strict":
+        # We can only specialize strict errors
+        return None
+
+    encoding = encoding.lower().replace("_", "-")  # normalize
+    # Specialized encodings and their accepted aliases
+    if encoding in ["u8", "utf", "utf8", "utf-8", "cp65001"]:
+        return builder.call_c(bytes_decode_utf8_strict, [builder.accept(callee.expr)], expr.line)
+    elif encoding in ["646", "ascii", "usascii", "us-ascii"]:
+        return builder.call_c(bytes_decode_ascii_strict, [builder.accept(callee.expr)], expr.line)
+    elif encoding in [
+        "iso8859-1",
+        "iso-8859-1",
+        "8859",
+        "cp819",
+        "latin",
+        "latin1",
+        "latin-1",
+        "l1",
+    ]:
+        return builder.call_c(bytes_decode_latin1_strict, [builder.accept(callee.expr)], expr.line)
+
+    return None
+
+
+@specialize_function("mypy_extensions.i64")
+def translate_i64(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    arg_type = builder.node_type(arg)
+    if is_int64_rprimitive(arg_type):
+        return builder.accept(arg)
+    elif is_int32_rprimitive(arg_type) or is_int16_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Extend(val, int64_rprimitive, signed=True, line=expr.line))
+    elif is_uint8_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Extend(val, int64_rprimitive, signed=False, line=expr.line))
+    elif is_int_rprimitive(arg_type) or is_bool_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.coerce(val, int64_rprimitive, expr.line)
+    return None
+
+
+@specialize_function("mypy_extensions.i32")
+def translate_i32(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    arg_type = builder.node_type(arg)
+    if is_int32_rprimitive(arg_type):
+        return builder.accept(arg)
+    elif is_int64_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Truncate(val, int32_rprimitive, line=expr.line))
+    elif is_int16_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Extend(val, int32_rprimitive, signed=True, line=expr.line))
+    elif is_uint8_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Extend(val, int32_rprimitive, signed=False, line=expr.line))
+    elif is_int_rprimitive(arg_type) or is_bool_rprimitive(arg_type):
+        val = builder.accept(arg)
+        val = truncate_literal(val, int32_rprimitive)
+        return builder.coerce(val, int32_rprimitive, expr.line)
+    return None
+
+
+@specialize_function("mypy_extensions.i16")
+def translate_i16(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    arg_type = builder.node_type(arg)
+    if is_int16_rprimitive(arg_type):
+        return builder.accept(arg)
+    elif is_int32_rprimitive(arg_type) or is_int64_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Truncate(val, int16_rprimitive, line=expr.line))
+    elif is_uint8_rprimitive(arg_type):
+        val = builder.accept(arg)
+        return builder.add(Extend(val, int16_rprimitive, signed=False, line=expr.line))
+    elif is_int_rprimitive(arg_type) or is_bool_rprimitive(arg_type):
+        val = builder.accept(arg)
+        val = truncate_literal(val, int16_rprimitive)
+        return builder.coerce(val, int16_rprimitive, expr.line)
+    return None
+
+
+@specialize_function("mypy_extensions.u8")
+def translate_u8(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    arg_type = builder.node_type(arg)
+    if is_uint8_rprimitive(arg_type):
+        return builder.accept(arg)
+    elif (
+        is_int16_rprimitive(arg_type)
+        or is_int32_rprimitive(arg_type)
+        or is_int64_rprimitive(arg_type)
+    ):
+        val = builder.accept(arg)
+        return builder.add(Truncate(val, uint8_rprimitive, line=expr.line))
+    elif is_int_rprimitive(arg_type) or is_bool_rprimitive(arg_type):
+        val = builder.accept(arg)
+        val = truncate_literal(val, uint8_rprimitive)
+        return builder.coerce(val, uint8_rprimitive, expr.line)
+    return None
+
+
+def truncate_literal(value: Value, rtype: RPrimitive) -> Value:
+    """If value is an integer literal value, truncate it to given native int rtype.
+
+    For example, truncate 256 into 0 if rtype is u8.
+    """
+    if not isinstance(value, Integer):
+        return value  # Not a literal, nothing to do
+    x = value.numeric_value()
+    max_unsigned = (1 << (rtype.size * 8)) - 1
+    x = x & max_unsigned
+    if rtype.is_signed and x >= (max_unsigned + 1) // 2:
+        # Adjust to make it a negative value
+        x -= max_unsigned + 1
+    return Integer(x, rtype)
+
+
+@specialize_function("builtins.int")
+def translate_int(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    arg_type = builder.node_type(arg)
+    if (
+        is_bool_rprimitive(arg_type)
+        or is_int_rprimitive(arg_type)
+        or is_fixed_width_rtype(arg_type)
+    ):
+        src = builder.accept(arg)
+        return builder.coerce(src, int_rprimitive, expr.line)
+    return None
+
+
+@specialize_function("builtins.bool")
+def translate_bool(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    src = builder.accept(arg)
+    return builder.builder.bool_value(src)
+
+
+@specialize_function("builtins.float")
+def translate_float(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg = expr.args[0]
+    arg_type = builder.node_type(arg)
+    if is_float_rprimitive(arg_type):
+        # No-op float conversion.
+        return builder.accept(arg)
+    return None
+
+
+@specialize_function("builtins.ord")
+def translate_ord(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    if len(expr.args) != 1 or expr.arg_kinds[0] != ARG_POS:
+        return None
+    arg_expr = expr.args[0]
+    arg = constant_fold_expr(builder, arg_expr)
+    if isinstance(arg, (str, bytes)) and len(arg) == 1:
+        return Integer(ord(arg))
+
+    # Check for ord(s[i]) where s is str and i is an integer
+    if isinstance(arg_expr, IndexExpr):
+        # Check base type
+        base_type = builder.node_type(arg_expr.base)
+        if is_str_rprimitive(base_type):
+            # Check index type
+            index_expr = arg_expr.index
+            index_type = builder.node_type(index_expr)
+            if is_tagged(index_type) or is_fixed_width_rtype(index_type):
+                # This is ord(s[i]) where s is str and i is an integer.
+                # Generate specialized inline code using the helper.
+                result = translate_getitem_with_bounds_check(
+                    builder,
+                    arg_expr.base,
+                    [arg_expr.index],
+                    expr,
+                    str_adjust_index_op,
+                    str_range_check_op,
+                    str_get_item_unsafe_as_int_op,
+                )
+                return result
+
+    return None
+
+
+def is_object(callee: RefExpr) -> bool:
+    """Returns True for object.<name> calls."""
+    return (
+        isinstance(callee, MemberExpr)
+        and isinstance(callee.expr, NameExpr)
+        and callee.expr.fullname == "builtins.object"
+    )
+
+
+def is_super_or_object(expr: CallExpr, callee: RefExpr) -> bool:
+    """Returns True for super().<name> or object.<name> calls."""
+    return isinstance(expr.callee, SuperExpr) or is_object(callee)
+
+
+@specialize_function("__new__", object_rprimitive)
+def translate_object_new(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    fn = builder.fn_info
+    if fn.name != "__new__" or not is_super_or_object(expr, callee):
+        return None
+
+    ir = builder.get_current_class_ir()
+    if ir is None:
+        return None
+
+    call = '"object.__new__()"'
+    if not ir.is_ext_class:
+        builder.error(f"{call} not supported for non-extension classes", expr.line)
+        return None
+    if ir.inherits_python:
+        builder.error(
+            f"{call} not supported for classes inheriting from non-native classes", expr.line
+        )
+        return None
+    if len(expr.args) != 1:
+        builder.error(f"{call} supported only with 1 argument, got {len(expr.args)}", expr.line)
+        return None
+
+    typ_arg = expr.args[0]
+    method_args = fn.fitem.arg_names
+    if isinstance(typ_arg, NameExpr) and len(method_args) > 0 and method_args[0] == typ_arg.name:
+        subtype = builder.accept(expr.args[0])
+        subs = ir.subclasses()
+        if subs is not None and len(subs) == 0:
+            return builder.add(Call(ir.setup, [subtype], expr.line))
+        # Call a function that dynamically resolves the setup function of extension classes from the type object.
+        # This is necessary because the setup involves default attribute initialization and setting up
+        # the vtable which are specific to a given type and will not work if a subtype is created using
+        # the setup function of its base.
+        return builder.call_c(setup_object, [subtype], expr.line)
+
+    return None
+
+
+@specialize_function("__setattr__", object_rprimitive)
+def translate_object_setattr(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
+    is_super = isinstance(expr.callee, SuperExpr)
+    is_object_callee = is_object(callee)
+    if not ((is_super and len(expr.args) >= 2) or (is_object_callee and len(expr.args) >= 3)):
+        return None
+
+    self_reg = builder.accept(expr.args[0]) if is_object_callee else builder.self()
+    ir = builder.get_current_class_ir()
+    if ir and (not ir.is_ext_class or ir.builtin_base or ir.inherits_python):
+        return None
+    # Need to offset by 1 for super().__setattr__ calls because there is no self arg in this case.
+    name_idx = 0 if is_super else 1
+    value_idx = 1 if is_super else 2
+    attr_name = expr.args[name_idx]
+    attr_value = expr.args[value_idx]
+    value = builder.accept(attr_value)
+
+    if isinstance(attr_name, StrExpr) and ir and ir.has_attr(attr_name.value):
+        name = attr_name.value
+        value = builder.coerce(value, ir.attributes[name], expr.line)
+        return builder.add(SetAttr(self_reg, name, value, expr.line))
+
+    name_reg = builder.accept(attr_name)
+    return builder.call_c(generic_setattr, [self_reg, name_reg, value], expr.line)
+
+
+def translate_getitem_with_bounds_check(
+    builder: IRBuilder,
+    base_expr: Expression,
+    args: list[Expression],
+    ctx_expr: Expression,
+    adjust_index_op: PrimitiveDescription,
+    range_check_op: PrimitiveDescription,
+    get_item_unsafe_op: PrimitiveDescription,
+) -> Value | None:
+    """Shared helper for optimized __getitem__ with bounds checking.
+
+    This implements the common pattern of:
+    1. Adjusting negative indices
+    2. Checking if index is in valid range
+    3. Raising IndexError if out of range
+    4. Getting the item if in range
+
+    Args:
+        builder: The IR builder
+        base_expr: The base object expression
+        args: The arguments to __getitem__ (should be length 1)
+        ctx_expr: The context expression for line numbers
+        adjust_index_op: Primitive op to adjust negative indices
+        range_check_op: Primitive op to check if index is in valid range
+        get_item_unsafe_op: Primitive op to get item (no bounds checking)
+
+    Returns:
+        The result value, or None if optimization doesn't apply
+    """
+    # Check that we have exactly one argument
+    if len(args) != 1:
+        return None
+
+    # Get the object
+    obj = builder.accept(base_expr)
+
+    # Get the index argument
+    index = builder.accept(args[0])
+
+    # Adjust the index (handle negative indices)
+    adjusted_index = builder.primitive_op(adjust_index_op, [obj, index], ctx_expr.line)
+
+    # Check if the adjusted index is in valid range
+    range_check = builder.primitive_op(range_check_op, [obj, adjusted_index], ctx_expr.line)
+
+    # Create blocks for branching
+    valid_block = BasicBlock()
+    invalid_block = BasicBlock()
+
+    builder.add_bool_branch(range_check, valid_block, invalid_block)
+
+    # Handle invalid index - raise IndexError
+    builder.activate_block(invalid_block)
+    builder.add(
+        RaiseStandardError(RaiseStandardError.INDEX_ERROR, "index out of range", ctx_expr.line)
+    )
+    builder.add(Unreachable())
+
+    # Handle valid index - get the item
+    builder.activate_block(valid_block)
+    result = builder.primitive_op(get_item_unsafe_op, [obj, adjusted_index], ctx_expr.line)
+
+    return result
+
+
+@specialize_dunder("__getitem__", bytes_writer_rprimitive)
+def translate_bytes_writer_get_item(
+    builder: IRBuilder, base_expr: Expression, args: list[Expression], ctx_expr: Expression
+) -> Value | None:
+    """Optimized BytesWriter.__getitem__ implementation with bounds checking."""
+    return translate_getitem_with_bounds_check(
+        builder,
+        base_expr,
+        args,
+        ctx_expr,
+        bytes_writer_adjust_index_op,
+        bytes_writer_range_check_op,
+        bytes_writer_get_item_unsafe_op,
+    )
+
+
+@specialize_dunder("__setitem__", bytes_writer_rprimitive)
+def translate_bytes_writer_set_item(
+    builder: IRBuilder, base_expr: Expression, args: list[Expression], ctx_expr: Expression
+) -> Value | None:
+    """Optimized BytesWriter.__setitem__ implementation with bounds checking."""
+    # Check that we have exactly two arguments (index and value)
+    if len(args) != 2:
+        return None
+
+    # Get the BytesWriter object
+    obj = builder.accept(base_expr)
+
+    # Get the index and value arguments
+    index = builder.accept(args[0])
+    value = builder.accept(args[1])
+
+    # Adjust the index (handle negative indices)
+    adjusted_index = builder.primitive_op(
+        bytes_writer_adjust_index_op, [obj, index], ctx_expr.line
+    )
+
+    # Check if the adjusted index is in valid range
+    range_check = builder.primitive_op(
+        bytes_writer_range_check_op, [obj, adjusted_index], ctx_expr.line
+    )
+
+    # Create blocks for branching
+    valid_block = BasicBlock()
+    invalid_block = BasicBlock()
+
+    builder.add_bool_branch(range_check, valid_block, invalid_block)
+
+    # Handle invalid index - raise IndexError
+    builder.activate_block(invalid_block)
+    builder.add(
+        RaiseStandardError(RaiseStandardError.INDEX_ERROR, "index out of range", ctx_expr.line)
+    )
+    builder.add(Unreachable())
+
+    # Handle valid index - set the item
+    builder.activate_block(valid_block)
+    builder.primitive_op(
+        bytes_writer_set_item_unsafe_op, [obj, adjusted_index, value], ctx_expr.line
+    )
+
+    return builder.none()
+
+
+@specialize_dunder("__getitem__", bytes_rprimitive)
+def translate_bytes_get_item(
+    builder: IRBuilder, base_expr: Expression, args: list[Expression], ctx_expr: Expression
+) -> Value | None:
+    """Optimized bytes.__getitem__ implementation with bounds checking."""
+    return translate_getitem_with_bounds_check(
+        builder,
+        base_expr,
+        args,
+        ctx_expr,
+        bytes_adjust_index_op,
+        bytes_range_check_op,
+        bytes_get_item_unsafe_op,
+    )
