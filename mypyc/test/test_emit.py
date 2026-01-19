@@ -28,7 +28,7 @@ class TestPformatDeterministic(unittest.TestCase):
         fs_large = frozenset({("a", 1), ("b", 2)})
         literal_a = frozenset({fs_large, fs_small})
         literal_b = frozenset({fs_small, fs_large})
-        expected = "frozenset({frozenset({('b', 2), ('a', 1)}), frozenset({('a', 1)})})"
+        expected = "frozenset({frozenset({('a', 1)}), frozenset({('a', 1), ('b', 2)})})"
 
         assert pformat_deterministic(literal_a, 80) == expected
         assert pformat_deterministic(literal_b, 80) == expected
@@ -39,15 +39,15 @@ class TestPformatDeterministic(unittest.TestCase):
         item_b = ("outer", 2, frozenset({("x", 3)}))
         literal_a = frozenset({item_a, item_b})
         literal_b = frozenset({item_b, item_a})
-        expected = "frozenset({('outer', 2, frozenset({('x', 3)})), ('outer', 1, frozenset({('n', 1), ('m', 0)}))})"
+        expected = "frozenset({('outer', 1, frozenset({('m', 0), ('n', 1)})), ('outer', 2, frozenset({('x', 3)}))})"
 
         assert pformat_deterministic(literal_a, 120) == expected
         assert pformat_deterministic(literal_b, 120) == expected
 
     def test_restores_default_safe_key(self) -> None:
-        original_safe_key = pprint._safe_key
+        original_safe_key = getattr(pprint, "_safe_key", None)
         pformat_deterministic({"key": "value"}, 80)
-        assert pprint._safe_key is original_safe_key
+        assert getattr(pprint, "_safe_key", None) is original_safe_key
 
 
 class TestEmitter(unittest.TestCase):
