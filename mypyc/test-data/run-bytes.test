@@ -529,6 +529,7 @@ def test_optional_ne() -> None:
     assert ne_b_b_opt(b'x', None)
 
 [case testBytesRjustLjust]
+from mypy_extensions import mypyc_attr
 from testutil import assertRaises
 
 def rjust_bytes(b: bytes, width: int, fill: bytes = b' ') -> bytes:
@@ -567,3 +568,11 @@ def test_edge_cases() -> None:
         rjust_bytes(b'abc', 5, b'')
     with assertRaises(TypeError):
         ljust_bytes(b'abc', 5, b'12')
+
+@mypyc_attr(native_class=False)
+class SubBytes(bytes):
+    def rjust(self, width: int, fill: bytes | bytearray = b' ') -> bytes:
+        return b'override'
+
+def test_subclass_override() -> None:
+    assert rjust_bytes(SubBytes(b'abc'), 6) == b'override'

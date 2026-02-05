@@ -144,12 +144,46 @@ CPyTagged CPyBytes_Ord(PyObject *obj) {
 }
 
 
-PyObject *CPyBytes_RjustDefaultFill(PyObject *self, CPyTagged width) {
-    if (!PyBytes_Check(self)) {
-        PyErr_SetString(PyExc_TypeError, "self must be bytes");
+static PyObject *CPyBytes_Just(PyObject *self, CPyTagged width, PyObject *fillbyte, int left) {
+    if (!PyBytes_CheckExact(self)) {
+        PyObject *width_obj = CPyTagged_AsObject(width);
+        if (width_obj == NULL) {
+            return NULL;
+        }
+        PyObject *result = NULL;
+        if (fillbyte != NULL) {
+            result = PyObject_CallMethod(self, left ? "ljust" : "rjust", "OO", width_obj, fillbyte);
+        } else {
+            result = PyObject_CallMethod(self, left ? "ljust" : "rjust", "O", width_obj);
+        }
+        Py_DECREF(width_obj);
+        return result;
+    }
+
+    char fill = ' ';
+    if (fillbyte != NULL) {
+        if (PyBytes_Check(fillbyte)) {
+            if (PyBytes_Size(fillbyte) != 1) {
+                PyErr_SetString(PyExc_TypeError, "fillbyte must be a single byte");
+                return NULL;
+            }
+            fill = PyBytes_AsString(fillbyte)[0];
+        } else if (PyByteArray_Check(fillbyte)) {
+            if (PyByteArray_Size(fillbyte) != 1) {
+                PyErr_SetString(PyExc_TypeError, "fillbyte must be a single byte");
+                return NULL;
+            }
+            fill = PyByteArray_AS_STRING(fillbyte)[0];
+        } else {
+            PyErr_SetString(PyExc_TypeError, "fillbyte must be a single byte");
+            return NULL;
+        }
+    }
+
+    Py_ssize_t width_size_t = CPyTagged_AsSsize_t(width);
+    if (width_size_t == -1 && PyErr_Occurred()) {
         return NULL;
     }
-    Py_ssize_t width_size_t = CPyTagged_AsSsize_t(width);
     Py_ssize_t len = PyBytes_Size(self);
     if (width_size_t <= len) {
         Py_INCREF(self);
@@ -159,82 +193,31 @@ PyObject *CPyBytes_RjustDefaultFill(PyObject *self, CPyTagged width) {
     PyObject *result = PyBytes_FromStringAndSize(NULL, width_size_t);
     if (!result) return NULL;
     char *res_buf = PyBytes_AsString(result);
-    memset(res_buf, ' ', pad);
-    memcpy(res_buf + pad, PyBytes_AsString(self), len);
+    const char *self_buf = PyBytes_AsString(self);
+    if (left) {
+        memcpy(res_buf, self_buf, len);
+        memset(res_buf + len, fill, pad);
+    } else {
+        memset(res_buf, fill, pad);
+        memcpy(res_buf + pad, self_buf, len);
+    }
     return result;
 }
 
+PyObject *CPyBytes_RjustDefaultFill(PyObject *self, CPyTagged width) {
+    return CPyBytes_Just(self, width, NULL, 0);
+}
 
 PyObject *CPyBytes_RjustCustomFill(PyObject *self, CPyTagged width, PyObject *fillbyte) {
-    if (!PyBytes_Check(self)) {
-        PyErr_SetString(PyExc_TypeError, "self must be bytes");
-        return NULL;
-    }
-    if (!PyBytes_Check(fillbyte) || PyBytes_Size(fillbyte) != 1) {
-        PyErr_SetString(PyExc_TypeError, "fillbyte must be a single byte");
-        return NULL;
-    }
-    Py_ssize_t width_size_t = CPyTagged_AsSsize_t(width);
-    Py_ssize_t len = PyBytes_Size(self);
-    if (width_size_t <= len) {
-        Py_INCREF(self);
-        return self;
-    }
-    char fill = PyBytes_AsString(fillbyte)[0];
-    Py_ssize_t pad = width_size_t - len;
-    PyObject *result = PyBytes_FromStringAndSize(NULL, width_size_t);
-    if (!result) return NULL;
-    char *res_buf = PyBytes_AsString(result);
-    memset(res_buf, fill, pad);
-    memcpy(res_buf + pad, PyBytes_AsString(self), len);
-    return result;
+    return CPyBytes_Just(self, width, fillbyte, 0);
 }
-
 
 PyObject *CPyBytes_LjustDefaultFill(PyObject *self, CPyTagged width) {
-    if (!PyBytes_Check(self)) {
-        PyErr_SetString(PyExc_TypeError, "self must be bytes");
-        return NULL;
-    }
-    Py_ssize_t width_size_t = CPyTagged_AsSsize_t(width);
-    Py_ssize_t len = PyBytes_Size(self);
-    if (width_size_t <= len) {
-        Py_INCREF(self);
-        return self;
-    }
-    Py_ssize_t pad = width_size_t - len;
-    PyObject *result = PyBytes_FromStringAndSize(NULL, width_size_t);
-    if (!result) return NULL;
-    char *res_buf = PyBytes_AsString(result);
-    memcpy(res_buf, PyBytes_AsString(self), len);
-    memset(res_buf + len, ' ', pad);
-    return result;
+    return CPyBytes_Just(self, width, NULL, 1);
 }
 
-
 PyObject *CPyBytes_LjustCustomFill(PyObject *self, CPyTagged width, PyObject *fillbyte) {
-    if (!PyBytes_Check(self)) {
-        PyErr_SetString(PyExc_TypeError, "self must be bytes");
-        return NULL;
-    }
-    if (!PyBytes_Check(fillbyte) || PyBytes_Size(fillbyte) != 1) {
-        PyErr_SetString(PyExc_TypeError, "fillbyte must be a single byte");
-        return NULL;
-    }
-    Py_ssize_t width_size_t = CPyTagged_AsSsize_t(width);
-    Py_ssize_t len = PyBytes_Size(self);
-    if (width_size_t <= len) {
-        Py_INCREF(self);
-        return self;
-    }
-    char fill = PyBytes_AsString(fillbyte)[0];
-    Py_ssize_t pad = width_size_t - len;
-    PyObject *result = PyBytes_FromStringAndSize(NULL, width_size_t);
-    if (!result) return NULL;
-    char *res_buf = PyBytes_AsString(result);
-    memcpy(res_buf, PyBytes_AsString(self), len);
-    memset(res_buf + len, fill, pad);
-    return result;
+    return CPyBytes_Just(self, width, fillbyte, 1);
 }
 
 
