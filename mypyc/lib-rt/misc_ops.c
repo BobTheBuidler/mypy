@@ -252,8 +252,15 @@ PyObject *CPyType_FromTemplate(PyObject *template,
     // inherited in PyType_Ready, which we needed for subclassing
     // BaseException. XXX: Taking the first element is wrong I think though.
     if (bases) {
-        t->ht_type.tp_base = (PyTypeObject *)PyTuple_GET_ITEM(bases, 0);
+        PyTypeObject *base = (PyTypeObject *)PyTuple_GET_ITEM(bases, 0);
+        t->ht_type.tp_base = base;
         Py_INCREF((PyObject *)t->ht_type.tp_base);
+        if (t->ht_type.tp_basicsize < base->tp_basicsize) {
+            t->ht_type.tp_basicsize = base->tp_basicsize;
+        }
+        if (t->ht_type.tp_itemsize < base->tp_itemsize) {
+            t->ht_type.tp_itemsize = base->tp_itemsize;
+        }
     }
 
     t->ht_name = name;

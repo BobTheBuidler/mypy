@@ -1,0 +1,15 @@
+[case testDefaultdictSubclassInit]
+from collections import defaultdict
+
+class DD(defaultdict):
+    def __init__(self) -> None:
+        super().__init__(int)
+
+[file driver.py]
+from native import DD
+
+d = DD()
+print(d["x"])
+
+[out]
+0

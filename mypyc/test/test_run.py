@@ -54,6 +54,7 @@ files = [
     "run-tuples.test",
     "run-lists.test",
     "run-dicts.test",
+    "run-defaultdict.test",
     "run-sets.test",
     "run-primitives.test",
     "run-loops.test",
