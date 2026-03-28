@@ -26,7 +26,7 @@ from mypyc.irbuild.builder import IRBuilder
 from mypyc.irbuild.constant_fold import constant_fold_expr
 from mypyc.primitives.bytes_ops import bytes_build_op
 from mypyc.primitives.int_ops import int_to_str_op
-from mypyc.primitives.str_ops import ascii_op, str_build_op, str_op
+from mypyc.primitives.str_ops import ascii_op, repr_op, str_build_op, str_op
 
 
 @unique
@@ -43,6 +43,7 @@ class FormatOp(Enum):
     STR = "s"
     INT = "d"
     ASCII = "a"
+    REPR = "r"
     BYTES = "b"
 
 
@@ -51,30 +52,37 @@ def generate_format_ops(specifiers: list[ConversionSpecifier]) -> list[FormatOp]
 
     Different ConversionSpecifiers may share a same FormatOp.
     """
+    # Conversion flags for str.format/f-strings (e.g. {!a}/{!r}); only if no format spec.
+    conversion_map = {
+        "!a": FormatOp.ASCII,
+        "!r": FormatOp.REPR,
+    }
+    # printf-style tokens and special f-string lowering patterns.
+    whole_seq_map = {
+        "%s": FormatOp.STR,
+        "{:{}}": FormatOp.STR,
+        "%d": FormatOp.INT,
+        "%a": FormatOp.ASCII,
+        "%r": FormatOp.REPR,
+        "%b": FormatOp.BYTES,
+    }
+
     format_ops = []
     for spec in specifiers:
         # TODO: Match specifiers instead of using whole_seq
         # Conversion flags for str.format/f-strings (e.g. {!a}); only if no format spec.
         if spec.conversion and not spec.format_spec:
-            if spec.conversion == "!a":
-                format_op = FormatOp.ASCII
-            else:
+            format_op = conversion_map.get(spec.conversion)
+            if format_op is None:
                 return None
-        # printf-style tokens and special f-string lowering patterns.
-        elif spec.whole_seq == "%s" or spec.whole_seq == "{:{}}":
-            format_op = FormatOp.STR
-        elif spec.whole_seq == "%d":
-            format_op = FormatOp.INT
-        elif spec.whole_seq == "%a":
-            format_op = FormatOp.ASCII
-        elif spec.whole_seq == "%b":
-            format_op = FormatOp.BYTES
-        # Any other non-empty spec means we can't optimize; fall back to runtime formatting.
-        elif spec.whole_seq:
-            return None
-        # Empty spec ("{}") defaults to str().
         else:
-            format_op = FormatOp.STR
+            format_op = whole_seq_map.get(spec.whole_seq)
+            if format_op is None:
+                # Any other non-empty spec means we can't optimize; fall back to runtime formatting.
+                if spec.whole_seq:
+                    return None
+                # Empty spec ("{}") defaults to str().
+                format_op = FormatOp.STR
         format_ops.append(format_op)
     return format_ops
 
@@ -169,6 +177,11 @@ def convert_format_expr_to_str(
                 var_str = builder.load_literal_value(ascii(folded))
             else:
                 var_str = builder.primitive_op(ascii_op, [builder.accept(x)], line)
+        elif format_op == FormatOp.REPR:
+            if (folded := constant_fold_expr(builder, x)) is not None:
+                var_str = builder.load_literal_value(repr(folded))
+            else:
+                var_str = builder.primitive_op(repr_op, [builder.accept(x)], line)
         elif format_op == FormatOp.INT:
             if isinstance(folded := constant_fold_expr(builder, x), int):
                 var_str = builder.load_literal_value(str(folded))

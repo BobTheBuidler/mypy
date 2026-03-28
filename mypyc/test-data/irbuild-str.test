@@ -327,6 +327,19 @@ L0:
     s5 = r18
     return 1
 
+[case testAsciiBuiltin]
+from typing import NewType, Union
+NewStr = NewType("NewStr", str)
+def f(var: Union[str, NewStr]) -> str:
+    return ascii(var)
+[typing fixtures/typing-full.pyi]
+[out]
+def f(var):
+    var, r0 :: str
+L0:
+    r0 = PyObject_ASCII(var)
+    return r0
+
 [case testDecode]
 def f(b: bytes) -> None:
     b.decode()
